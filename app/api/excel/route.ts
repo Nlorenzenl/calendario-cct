@@ -15,28 +15,74 @@ type Trabajo = {
 };
 
 function normalizeText(value: unknown): string {
-  return String(value ?? "").trim();
+  return String(value ?? "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function normalizeDate(value: string): string {
   const clean = normalizeText(value);
+
   if (!clean) return "";
 
-  const match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (!match) return clean;
+  const ddmmyyyy = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (ddmmyyyy) {
+    const day = ddmmyyyy[1].padStart(2, "0");
+    const month = ddmmyyyy[2].padStart(2, "0");
+    const year = ddmmyyyy[3];
+    return `${day}/${month}/${year}`;
+  }
 
-  const day = match[1].padStart(2, "0");
-  const month = match[2].padStart(2, "0");
-  const year = match[3];
+  const ddmmyy = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (ddmmyy) {
+    const day = ddmmyy[1].padStart(2, "0");
+    const month = ddmmyy[2].padStart(2, "0");
+    const yy = Number(ddmmyy[3]);
+    const year = yy < 50 ? `20${ddmmyy[3]}` : `19${ddmmyy[3]}`;
+    return `${day}/${month}/${year}`;
+  }
 
-  return `${day}/${month}/${year}`;
+  return clean;
 }
 
-function pick(row: Record<string, string>, keys: string[]): string {
-  for (const key of keys) {
-    if (key in row) return normalizeText(row[key]);
-  }
-  return "";
+function isValidDate(value: string): boolean {
+  return /^\d{2}\/\d{2}\/\d{4}$/.test(value);
+}
+
+function isHeaderRow(row: string[]): boolean {
+  const a = normalizeText(row[0]).toLowerCase();
+  const b = normalizeText(row[1]).toLowerCase();
+  return a === "fecha" && (b.includes("pt") || b.includes("n° pt") || b.includes("nº pt"));
+}
+
+function isDayTitleRow(row: string[]): boolean {
+  const joined = row.map(normalizeText).join(" ").toLowerCase();
+  return (
+    joined.includes("lunes") ||
+    joined.includes("martes") ||
+    joined.includes("miercoles") ||
+    joined.includes("miércoles") ||
+    joined.includes("jueves") ||
+    joined.includes("viernes") ||
+    joined.includes("sabado") ||
+    joined.includes("sábado") ||
+    joined.includes("domingo")
+  );
+}
+
+function isEmptyRow(row: string[]): boolean {
+  return row.every((cell) => normalizeText(cell) === "");
+}
+
+function hasUsefulContent(row: string[]): boolean {
+  return Boolean(
+    normalizeText(row[1]) ||
+    normalizeText(row[2]) ||
+    normalizeText(row[5]) ||
+    normalizeText(row[6]) ||
+    normalizeText(row[7])
+  );
 }
 
 export async function GET() {
@@ -60,87 +106,49 @@ export async function GET() {
 
     const text = await response.text();
 
-    const records = parse(text, {
-      columns: true,
-      skip_empty_lines: true,
+    const rows = parse(text, {
       bom: true,
       relax_column_count: true,
-      trim: true,
-    }) as Record<string, string>[];
+      skip_empty_lines: false,
+      trim: false,
+    }) as string[][];
 
-    const trabajos: Trabajo[] = records
-      .map((row) => {
-        // A
-        const fecha = normalizeDate(
-          pick(row, ["Fecha", "fecha"])
-        );
+    const trabajos: Trabajo[] = [];
+    let lastFecha = "";
 
-        // B
-        const pt = pick(row, ["N° PT", "Nº PT", "N°PT", "PT"]);
+    for (const rawRow of rows) {
+      const row = rawRow.slice(0, 11);
+      while (row.length < 11) row.push("");
 
-        // C
-        const area = pick(row, ["Area", "Área"]);
+      const aToK = row.map(normalizeText);
 
-        // D
-        const zonal = pick(row, ["Zonal"]);
+      if (isEmptyRow(aToK)) continue;
+      if (isDayTitleRow(aToK)) continue;
+      if (isHeaderRow(aToK)) continue;
 
-        // E
-        const tipoPermiso = pick(row, [
-          "Tipo de permiso de trabajo",
-          "Tipo permiso",
-          "Tipo"
-        ]);
+      const fechaNormalizada = normalizeDate(aToK[0]);
+      if (isValidDate(fechaNormalizada)) {
+        lastFecha = fechaNormalizada;
+      }
 
-        // F
-        const ssee = pick(row, [
-          "SSEE o LT",
-          "SSEE O LT",
-          "SSEE o lt",
-          "SSEE"
-        ]);
+      const fecha = isValidDate(fechaNormalizada) ? fechaNormalizada : lastFecha;
+      if (!fecha) continue;
+      if (!hasUsefulContent(aToK)) continue;
 
-        // G
-        const componente = pick(row, ["Componente"]);
-
-        // H
-        const descripcion = pick(row, [
-          "Descripción",
-          "Descripcion",
-          "Descripción del trabajo general",
-          "Descripcion del trabajo general"
-        ]);
-
-        // I
-        const prog = pick(row, ["Prog"]);
-
-        // J
-        const hinicio = pick(row, ["Hinicio", "Inicio", "Hinicio"]);
-
-        // K
-        const hfinalizacion = pick(row, [
-          "Hfinalización",
-          "Hfinalizacion",
-          "Finalización",
-          "Finalizacion"
-        ]);
-
-        if (!fecha) return null;
-
-        return {
-          fecha,
-          pt: pt || "Sin PT",
-          area,
-          zonal,
-          tipoPermiso,
-          ssee,
-          componente,
-          descripcion,
-          prog,
-          hinicio,
-          hfinalizacion,
-        };
-      })
-      .filter((item): item is Trabajo => item !== null);
+      trabajos.push({
+        fecha,
+        pt: aToK[1] || "Sin PT",
+        area: aToK[2],
+        zonal: aToK[3],
+        tipoPermiso: aToK[4],
+        ssee: aToK[5],
+        componente: aToK[6],
+        descripcion: aToK[7],
+        prog: aToK[8],
+        hinicio: aToK[9],
+        hfinalizacion: aToK[10],
+      });
+    }
 
     return Response.json({
       total: trabajos.length,
