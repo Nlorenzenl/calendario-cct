@@ -260,6 +260,11 @@ export default function Page() {
         fechaOriginal: draggedTrabajo.fecha,
         fechaNueva: formatDdMmYyyy(dropDate),
         pt: draggedTrabajo.pt,
+        ssee: draggedTrabajo.ssee,
+        componente: draggedTrabajo.componente,
+        descripcion: draggedTrabajo.descripcion,
+        hinicio: draggedTrabajo.hinicio,
+        hfinalizacion: draggedTrabajo.hfinalizacion,
         motivo: motivo.trim(),
       };
 
