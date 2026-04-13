@@ -3,8 +3,15 @@ import { parse } from "csv-parse/sync";
 type Trabajo = {
   fecha: string;
   pt: string;
+  area: string;
+  zonal: string;
+  tipoPermiso: string;
   ssee: string;
+  componente: string;
   descripcion: string;
+  prog: string;
+  hinicio: string;
+  hfinalizacion: string;
 };
 
 function normalizeText(value: unknown): string {
@@ -13,18 +20,23 @@ function normalizeText(value: unknown): string {
 
 function normalizeDate(value: string): string {
   const clean = normalizeText(value);
-
   if (!clean) return "";
 
   const match = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (match) {
-    const day = match[1].padStart(2, "0");
-    const month = match[2].padStart(2, "0");
-    const year = match[3];
-    return `${day}/${month}/${year}`;
-  }
+  if (!match) return clean;
 
-  return clean;
+  const day = match[1].padStart(2, "0");
+  const month = match[2].padStart(2, "0");
+  const year = match[3];
+
+  return `${day}/${month}/${year}`;
+}
+
+function pick(row: Record<string, string>, keys: string[]): string {
+  for (const key of keys) {
+    if (key in row) return normalizeText(row[key]);
+  }
+  return "";
 }
 
 export async function GET() {
@@ -58,24 +70,74 @@ export async function GET() {
 
     const trabajos: Trabajo[] = records
       .map((row) => {
-        const fecha = normalizeDate(row["Fecha"]);
-        const pt = normalizeText(row["N° PT"] || row["Nº PT"] || "");
-        const ssee = normalizeText(row["SSEE O LT"] || row["SSEE o LT"] || "");
-        const descripcion = normalizeText(
-          row["Descripcion"] ||
-            row["Descripción"] ||
-            row["Descripción del trabajo general"] ||
-            ""
+        // A
+        const fecha = normalizeDate(
+          pick(row, ["Fecha", "fecha"])
         );
 
+        // B
+        const pt = pick(row, ["N° PT", "Nº PT", "N°PT", "PT"]);
+
+        // C
+        const area = pick(row, ["Area", "Área"]);
+
+        // D
+        const zonal = pick(row, ["Zonal"]);
+
+        // E
+        const tipoPermiso = pick(row, [
+          "Tipo de permiso de trabajo",
+          "Tipo permiso",
+          "Tipo"
+        ]);
+
+        // F
+        const ssee = pick(row, [
+          "SSEE o LT",
+          "SSEE O LT",
+          "SSEE o lt",
+          "SSEE"
+        ]);
+
+        // G
+        const componente = pick(row, ["Componente"]);
+
+        // H
+        const descripcion = pick(row, [
+          "Descripción",
+          "Descripcion",
+          "Descripción del trabajo general",
+          "Descripcion del trabajo general"
+        ]);
+
+        // I
+        const prog = pick(row, ["Prog"]);
+
+        // J
+        const hinicio = pick(row, ["Hinicio", "Inicio", "Hinicio"]);
+
+        // K
+        const hfinalizacion = pick(row, [
+          "Hfinalización",
+          "Hfinalizacion",
+          "Finalización",
+          "Finalizacion"
+        ]);
+
         if (!fecha) return null;
-        if (!pt && !ssee && !descripcion) return null;
 
         return {
           fecha,
           pt: pt || "Sin PT",
+          area,
+          zonal,
+          tipoPermiso,
           ssee,
+          componente,
           descripcion,
+          prog,
+          hinicio,
+          hfinalizacion,
         };
       })
       .filter((item): item is Trabajo => item !== null);
