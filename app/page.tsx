@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Trabajo = {
+  rowNumber: number;
   fecha: string;
   pt: string;
   area: string;
@@ -28,28 +29,22 @@ type TrabajoConFecha = Trabajo & {
   id: string;
 };
 
+type ToastState = {
+  show: boolean;
+  message: string;
+  type: "success" | "error";
+};
+
 const MONTHS = [
-  "Enero",
-  "Febrero",
-  "Marzo",
-  "Abril",
-  "Mayo",
-  "Junio",
-  "Julio",
-  "Agosto",
-  "Septiembre",
-  "Octubre",
-  "Noviembre",
-  "Diciembre",
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ];
 
 const WEEK_DAYS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
 
-// URL de tu Apps Script
 const APPS_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbzFyRGbchAhOcNr_J0nabfjf6lBp_L6p0aLhExozoDNBeyf55uBkxfwxTYCKIE8hHBU/exec";
 
-// Debe coincidir exactamente con la propiedad APP_SECRET que guardaste en Apps Script
 const APPS_SCRIPT_SECRET = "cct_dragdrop_2026_9f3xk2_qp71";
 
 function parseDdMmYyyy(value: string): Date | null {
@@ -99,7 +94,7 @@ function getMonthMatrix(viewDate: Date) {
   const firstDayOfMonth = new Date(year, month, 1);
   const lastDayOfMonth = new Date(year, month + 1, 0);
 
-  const startOffset = (firstDayOfMonth.getDay() + 6) % 7; // lunes = 0
+  const startOffset = (firstDayOfMonth.getDay() + 6) % 7;
   const daysInMonth = lastDayOfMonth.getDate();
 
   const cells: Array<{ date: Date; inCurrentMonth: boolean }> = [];
@@ -142,11 +137,18 @@ export default function Page() {
   const [saving, setSaving] = useState(false);
   const [viewDate, setViewDate] = useState(new Date());
 
-  const [draggedTrabajo, setDraggedTrabajo] =
-    useState<TrabajoConFecha | null>(null);
+  const [draggedTrabajo, setDraggedTrabajo] = useState<TrabajoConFecha | null>(null);
   const [dropDate, setDropDate] = useState<Date | null>(null);
   const [motivo, setMotivo] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
+
+  const [toast, setToast] = useState<ToastState>({
+    show: false,
+    message: "",
+    type: "success",
+  });
+
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     async function loadData() {
@@ -158,9 +160,7 @@ export default function Page() {
         const data: ApiResponse = await res.json();
 
         if (!res.ok || data.error) {
-          throw new Error(
-            data.details || data.error || "Error cargando datos"
-          );
+          throw new Error(data.details || data.error || "Error cargando datos");
         }
 
         const parsed = (data.trabajos || [])
@@ -171,7 +171,7 @@ export default function Page() {
             return {
               ...t,
               fechaDate,
-              id: `${t.fecha}-${t.pt}-${t.ssee}-${index}`,
+              id: `${t.rowNumber}-${t.fecha}-${t.pt}-${index}`,
             };
           })
           .filter((t): t is TrabajoConFecha => t !== null);
@@ -190,7 +190,25 @@ export default function Page() {
     }
 
     loadData();
+
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
   }, []);
+
+  function showToast(message: string, type: "success" | "error") {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+
+    setToast({
+      show: true,
+      message,
+      type,
+    });
+
+    toastTimerRef.current = setTimeout(() => {
+      setToast((prev) => ({ ...prev, show: false }));
+    }, 2500);
+  }
 
   const monthCells = useMemo(() => getMonthMatrix(viewDate), [viewDate]);
 
@@ -219,6 +237,7 @@ export default function Page() {
   }
 
   function closeModal() {
+    if (saving) return;
     setModalOpen(false);
     setDropDate(null);
     setMotivo("");
@@ -228,7 +247,7 @@ export default function Page() {
     if (!draggedTrabajo || !dropDate) return;
 
     if (!motivo.trim()) {
-      alert("Debes ingresar el motivo del cambio.");
+      showToast("Debes ingresar el motivo del cambio.", "error");
       return;
     }
 
@@ -237,18 +256,10 @@ export default function Page() {
 
       const payload = {
         secret: APPS_SCRIPT_SECRET,
+        rowNumber: draggedTrabajo.rowNumber,
         fechaOriginal: draggedTrabajo.fecha,
         fechaNueva: formatDdMmYyyy(dropDate),
         pt: draggedTrabajo.pt,
-        area: draggedTrabajo.area,
-        zonal: draggedTrabajo.zonal,
-        tipoPermiso: draggedTrabajo.tipoPermiso,
-        ssee: draggedTrabajo.ssee,
-        componente: draggedTrabajo.componente,
-        descripcion: draggedTrabajo.descripcion,
-        prog: draggedTrabajo.prog,
-        hinicio: draggedTrabajo.hinicio,
-        hfinalizacion: draggedTrabajo.hfinalizacion,
         motivo: motivo.trim(),
       };
 
@@ -278,11 +289,14 @@ export default function Page() {
         })
       );
 
-      closeModal();
+      setModalOpen(false);
+      setDropDate(null);
+      setMotivo("");
       setDraggedTrabajo(null);
-      alert("Cambio guardado y registrado en HistorialCambios.");
+
+      showToast("Cambio guardado correctamente.", "success");
     } catch (err: any) {
-      alert(err?.message || "Error guardando cambio");
+      showToast(err?.message || "Error guardando cambio", "error");
     } finally {
       setSaving(false);
     }
@@ -308,11 +322,9 @@ export default function Page() {
       <div className="mx-auto max-w-7xl rounded-3xl bg-white p-5 shadow-sm md:p-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-slate-800">
-              Calendario CCT
-            </h1>
+            <h1 className="text-3xl font-bold text-slate-800">Calendario CCT</h1>
             <p className="mt-1 text-sm text-slate-600">
-              Drag & drop con registro en hoja de historial
+              Drag & drop con historial resumido
             </p>
           </div>
 
@@ -358,17 +370,13 @@ export default function Page() {
             </div>
             <div className="text-sm text-slate-600">
               Total de trabajos del mes:{" "}
-              <span className="font-semibold text-slate-800">
-                {totalMonthJobs}
-              </span>
+              <span className="font-semibold text-slate-800">{totalMonthJobs}</span>
             </div>
           </div>
 
           <div className="text-sm text-slate-600">
             Trabajos cargados:{" "}
-            <span className="font-semibold text-slate-800">
-              {trabajos.length}
-            </span>
+            <span className="font-semibold text-slate-800">{trabajos.length}</span>
           </div>
         </div>
 
@@ -399,9 +407,7 @@ export default function Page() {
                     {cell.date.getDate()}
                   </div>
                   <div className="text-xs text-slate-500">
-                    {cell.trabajos.length > 0
-                      ? `${cell.trabajos.length} trab.`
-                      : ""}
+                    {cell.trabajos.length > 0 ? `${cell.trabajos.length} trab.` : ""}
                   </div>
                 </div>
 
@@ -456,20 +462,16 @@ export default function Page() {
 
             <div className="mt-4 space-y-2 text-sm text-slate-700">
               <div>
-                <span className="font-semibold">PT:</span>{" "}
-                {draggedTrabajo.pt || "Sin PT"}
+                <span className="font-semibold">PT:</span> {draggedTrabajo.pt || "Sin PT"}
               </div>
               <div>
-                <span className="font-semibold">SSEE:</span>{" "}
-                {draggedTrabajo.ssee || "-"}
+                <span className="font-semibold">SSEE:</span> {draggedTrabajo.ssee || "-"}
               </div>
               <div>
-                <span className="font-semibold">Fecha original:</span>{" "}
-                {draggedTrabajo.fecha}
+                <span className="font-semibold">Fecha original:</span> {draggedTrabajo.fecha}
               </div>
               <div>
-                <span className="font-semibold">Fecha nueva:</span>{" "}
-                {formatDdMmYyyy(dropDate)}
+                <span className="font-semibold">Fecha nueva:</span> {formatDdMmYyyy(dropDate)}
               </div>
             </div>
 
@@ -502,6 +504,20 @@ export default function Page() {
                 {saving ? "Guardando..." : "Guardar cambio"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {toast.show && (
+        <div className="fixed right-4 top-4 z-[60]">
+          <div
+            className={`rounded-2xl px-4 py-3 text-sm font-medium shadow-lg ${
+              toast.type === "success"
+                ? "bg-emerald-600 text-white"
+                : "bg-red-600 text-white"
+            }`}
+          >
+            {toast.message}
           </div>
         </div>
       )}

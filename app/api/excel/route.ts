@@ -1,6 +1,7 @@
 import { parse } from "csv-parse/sync";
 
 type Trabajo = {
+  rowNumber: number;
   fecha: string;
   pt: string;
   area: string;
@@ -116,7 +117,10 @@ export async function GET() {
     const trabajos: Trabajo[] = [];
     let lastFecha = "";
 
-    for (const rawRow of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const rawRow = rows[i];
+      const rowNumber = i + 1; // fila real en Google Sheets / CSV
+
       const row = rawRow.slice(0, 11);
       while (row.length < 11) row.push("");
 
@@ -136,6 +140,7 @@ export async function GET() {
       if (!hasUsefulContent(aToK)) continue;
 
       trabajos.push({
+        rowNumber,
         fecha,
         pt: aToK[1] || "Sin PT",
         area: aToK[2],
