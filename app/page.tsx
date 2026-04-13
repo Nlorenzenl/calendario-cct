@@ -25,6 +25,7 @@ type ApiResponse = {
 
 type TrabajoConFecha = Trabajo & {
   fechaDate: Date;
+  id: string;
 };
 
 const MONTHS = [
@@ -43,6 +44,13 @@ const MONTHS = [
 ];
 
 const WEEK_DAYS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+
+// URL de tu Apps Script
+const APPS_SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbzFyRGbchAhOcNr_J0nabfjf6lBp_L6p0aLhExozoDNBeyf55uBkxfwxTYCKIE8hHBU/exec";
+
+// Debe coincidir exactamente con la propiedad APP_SECRET que guardaste en Apps Script
+const APPS_SCRIPT_SECRET = "cct_dragdrop_2026_9f3xk2_qp71";
 
 function parseDdMmYyyy(value: string): Date | null {
   const match = value.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
@@ -65,6 +73,13 @@ function parseDdMmYyyy(value: string): Date | null {
   return date;
 }
 
+function formatDdMmYyyy(date: Date) {
+  const d = String(date.getDate()).padStart(2, "0");
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const y = date.getFullYear();
+  return `${d}/${m}/${y}`;
+}
+
 function sameDay(a: Date, b: Date) {
   return (
     a.getFullYear() === b.getFullYear() &&
@@ -84,7 +99,7 @@ function getMonthMatrix(viewDate: Date) {
   const firstDayOfMonth = new Date(year, month, 1);
   const lastDayOfMonth = new Date(year, month + 1, 0);
 
-  const startOffset = (firstDayOfMonth.getDay() + 6) % 7;
+  const startOffset = (firstDayOfMonth.getDay() + 6) % 7; // lunes = 0
   const daysInMonth = lastDayOfMonth.getDate();
 
   const cells: Array<{ date: Date; inCurrentMonth: boolean }> = [];
@@ -124,7 +139,14 @@ export default function Page() {
   const [trabajos, setTrabajos] = useState<TrabajoConFecha[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
   const [viewDate, setViewDate] = useState(new Date());
+
+  const [draggedTrabajo, setDraggedTrabajo] =
+    useState<TrabajoConFecha | null>(null);
+  const [dropDate, setDropDate] = useState<Date | null>(null);
+  const [motivo, setMotivo] = useState("");
+  const [modalOpen, setModalOpen] = useState(false);
 
   useEffect(() => {
     async function loadData() {
@@ -136,14 +158,21 @@ export default function Page() {
         const data: ApiResponse = await res.json();
 
         if (!res.ok || data.error) {
-          throw new Error(data.details || data.error || "Error cargando datos");
+          throw new Error(
+            data.details || data.error || "Error cargando datos"
+          );
         }
 
         const parsed = (data.trabajos || [])
-          .map((t) => {
+          .map((t, index) => {
             const fechaDate = parseDdMmYyyy(t.fecha);
             if (!fechaDate) return null;
-            return { ...t, fechaDate };
+
+            return {
+              ...t,
+              fechaDate,
+              id: `${t.fecha}-${t.pt}-${t.ssee}-${index}`,
+            };
           })
           .filter((t): t is TrabajoConFecha => t !== null);
 
@@ -180,6 +209,85 @@ export default function Page() {
     ).length;
   }, [trabajos, viewDate]);
 
+  function handleDrop(targetDate: Date) {
+    if (!draggedTrabajo) return;
+    if (sameDay(draggedTrabajo.fechaDate, targetDate)) return;
+
+    setDropDate(targetDate);
+    setMotivo("");
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setDropDate(null);
+    setMotivo("");
+  }
+
+  async function confirmMove() {
+    if (!draggedTrabajo || !dropDate) return;
+
+    if (!motivo.trim()) {
+      alert("Debes ingresar el motivo del cambio.");
+      return;
+    }
+
+    try {
+      setSaving(true);
+
+      const payload = {
+        secret: APPS_SCRIPT_SECRET,
+        fechaOriginal: draggedTrabajo.fecha,
+        fechaNueva: formatDdMmYyyy(dropDate),
+        pt: draggedTrabajo.pt,
+        area: draggedTrabajo.area,
+        zonal: draggedTrabajo.zonal,
+        tipoPermiso: draggedTrabajo.tipoPermiso,
+        ssee: draggedTrabajo.ssee,
+        componente: draggedTrabajo.componente,
+        descripcion: draggedTrabajo.descripcion,
+        prog: draggedTrabajo.prog,
+        hinicio: draggedTrabajo.hinicio,
+        hfinalizacion: draggedTrabajo.hfinalizacion,
+        motivo: motivo.trim(),
+      };
+
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=utf-8",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || "No se pudo guardar el cambio");
+      }
+
+      setTrabajos((prev) =>
+        prev.map((t) => {
+          if (t.id !== draggedTrabajo.id) return t;
+
+          return {
+            ...t,
+            fecha: formatDdMmYyyy(dropDate),
+            fechaDate: new Date(dropDate),
+          };
+        })
+      );
+
+      closeModal();
+      setDraggedTrabajo(null);
+      alert("Cambio guardado y registrado en HistorialCambios.");
+    } catch (err: any) {
+      alert(err?.message || "Error guardando cambio");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   if (loading) {
     return <div className="p-10">Cargando...</div>;
   }
@@ -187,7 +295,7 @@ export default function Page() {
   if (error) {
     return (
       <div className="p-10">
-        <h1 className="text-2xl font-bold mb-4">Calendario CCT</h1>
+        <h1 className="mb-4 text-2xl font-bold">Calendario CCT</h1>
         <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-red-700">
           {error}
         </div>
@@ -200,9 +308,11 @@ export default function Page() {
       <div className="mx-auto max-w-7xl rounded-3xl bg-white p-5 shadow-sm md:p-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-slate-800">Calendario CCT</h1>
+            <h1 className="text-3xl font-bold text-slate-800">
+              Calendario CCT
+            </h1>
             <p className="mt-1 text-sm text-slate-600">
-              Lectura de columnas A hasta K desde la hoja API
+              Drag & drop con registro en hoja de historial
             </p>
           </div>
 
@@ -248,13 +358,17 @@ export default function Page() {
             </div>
             <div className="text-sm text-slate-600">
               Total de trabajos del mes:{" "}
-              <span className="font-semibold text-slate-800">{totalMonthJobs}</span>
+              <span className="font-semibold text-slate-800">
+                {totalMonthJobs}
+              </span>
             </div>
           </div>
 
           <div className="text-sm text-slate-600">
             Trabajos cargados:{" "}
-            <span className="font-semibold text-slate-800">{trabajos.length}</span>
+            <span className="font-semibold text-slate-800">
+              {trabajos.length}
+            </span>
           </div>
         </div>
 
@@ -277,21 +391,27 @@ export default function Page() {
                     ? "border-slate-200 bg-white"
                     : "border-slate-100 bg-slate-50"
                 }`}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => handleDrop(cell.date)}
               >
                 <div className="mb-3 flex items-center justify-between">
                   <div className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-800">
                     {cell.date.getDate()}
                   </div>
                   <div className="text-xs text-slate-500">
-                    {cell.trabajos.length > 0 ? `${cell.trabajos.length} trab.` : ""}
+                    {cell.trabajos.length > 0
+                      ? `${cell.trabajos.length} trab.`
+                      : ""}
                   </div>
                 </div>
 
                 <div className="space-y-2">
-                  {cell.trabajos.map((t, i) => (
+                  {cell.trabajos.map((t) => (
                     <div
-                      key={`${t.pt}-${i}`}
-                      className="rounded-xl border border-slate-200 bg-slate-50 p-2 shadow-sm"
+                      key={t.id}
+                      draggable
+                      onDragStart={() => setDraggedTrabajo(t)}
+                      className="cursor-move rounded-xl border border-slate-200 bg-slate-50 p-2 shadow-sm"
                     >
                       <div className="text-xs font-bold text-slate-800">
                         {t.pt || "Sin PT"}
@@ -326,6 +446,65 @@ export default function Page() {
           </div>
         </div>
       </div>
+
+      {modalOpen && draggedTrabajo && dropDate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+            <h2 className="text-xl font-bold text-slate-800">
+              Confirmar cambio de fecha
+            </h2>
+
+            <div className="mt-4 space-y-2 text-sm text-slate-700">
+              <div>
+                <span className="font-semibold">PT:</span>{" "}
+                {draggedTrabajo.pt || "Sin PT"}
+              </div>
+              <div>
+                <span className="font-semibold">SSEE:</span>{" "}
+                {draggedTrabajo.ssee || "-"}
+              </div>
+              <div>
+                <span className="font-semibold">Fecha original:</span>{" "}
+                {draggedTrabajo.fecha}
+              </div>
+              <div>
+                <span className="font-semibold">Fecha nueva:</span>{" "}
+                {formatDdMmYyyy(dropDate)}
+              </div>
+            </div>
+
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-700">
+                Motivo del cambio
+              </label>
+              <textarea
+                value={motivo}
+                onChange={(e) => setMotivo(e.target.value)}
+                className="min-h-[110px] w-full rounded-xl border border-slate-300 p-3 outline-none focus:border-slate-500"
+                placeholder="Ej: Reprogramación por factibilidad, clima, coordinación, etc."
+              />
+            </div>
+
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                onClick={closeModal}
+                disabled={saving}
+                className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+
+              <button
+                onClick={confirmMove}
+                disabled={saving}
+                className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+              >
+                {saving ? "Guardando..." : "Guardar cambio"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
