@@ -36,8 +36,18 @@ type ToastState = {
 };
 
 const MONTHS = [
-  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+  "Enero",
+  "Febrero",
+  "Marzo",
+  "Abril",
+  "Mayo",
+  "Junio",
+  "Julio",
+  "Agosto",
+  "Septiembre",
+  "Octubre",
+  "Noviembre",
+  "Diciembre",
 ];
 
 const WEEK_DAYS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
@@ -137,7 +147,8 @@ export default function Page() {
   const [saving, setSaving] = useState(false);
   const [viewDate, setViewDate] = useState(new Date());
 
-  const [draggedTrabajo, setDraggedTrabajo] = useState<TrabajoConFecha | null>(null);
+  const [draggedTrabajo, setDraggedTrabajo] =
+    useState<TrabajoConFecha | null>(null);
   const [dropDate, setDropDate] = useState<Date | null>(null);
   const [motivo, setMotivo] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -150,46 +161,63 @@ export default function Page() {
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  async function loadTrabajos() {
+    try {
+      setError("");
+
+      const res = await fetch("/api/excel", {
+        cache: "no-store",
+      });
+
+      const data: ApiResponse = await res.json();
+
+      if (!res.ok || data.error) {
+        throw new Error(data.details || data.error || "Error cargando datos");
+      }
+
+      const parsed = (data.trabajos || [])
+        .map((t, index) => {
+          const fechaDate = parseDdMmYyyy(t.fecha);
+          if (!fechaDate) return null;
+
+          return {
+            ...t,
+            fechaDate,
+            id: `${t.rowNumber}-${t.fecha}-${t.pt}-${index}`,
+          };
+        })
+        .filter((t): t is TrabajoConFecha => t !== null);
+
+      setTrabajos(parsed);
+
+      if (parsed.length > 0) {
+        const first = parsed[0].fechaDate;
+        setViewDate((prev) => {
+          const sameMonth =
+            prev.getFullYear() === first.getFullYear() &&
+            prev.getMonth() === first.getMonth();
+
+          if (sameMonth) return prev;
+
+          return new Date(first.getFullYear(), first.getMonth(), 1);
+        });
+      }
+    } catch (err: any) {
+      setError(err?.message || "Error cargando datos");
+    }
+  }
+
   useEffect(() => {
-    async function loadData() {
+    async function init() {
       try {
         setLoading(true);
-        setError("");
-
-        const res = await fetch("/api/excel", { cache: "no-store" });
-        const data: ApiResponse = await res.json();
-
-        if (!res.ok || data.error) {
-          throw new Error(data.details || data.error || "Error cargando datos");
-        }
-
-        const parsed = (data.trabajos || [])
-          .map((t, index) => {
-            const fechaDate = parseDdMmYyyy(t.fecha);
-            if (!fechaDate) return null;
-
-            return {
-              ...t,
-              fechaDate,
-              id: `${t.rowNumber}-${t.fecha}-${t.pt}-${index}`,
-            };
-          })
-          .filter((t): t is TrabajoConFecha => t !== null);
-
-        setTrabajos(parsed);
-
-        if (parsed.length > 0) {
-          const first = parsed[0].fechaDate;
-          setViewDate(new Date(first.getFullYear(), first.getMonth(), 1));
-        }
-      } catch (err: any) {
-        setError(err?.message || "Error cargando datos");
+        await loadTrabajos();
       } finally {
         setLoading(false);
       }
     }
 
-    loadData();
+    init();
 
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -282,22 +310,12 @@ export default function Page() {
         throw new Error(data.error || "No se pudo guardar el cambio");
       }
 
-      setTrabajos((prev) =>
-        prev.map((t) => {
-          if (t.id !== draggedTrabajo.id) return t;
-
-          return {
-            ...t,
-            fecha: formatDdMmYyyy(dropDate),
-            fechaDate: new Date(dropDate),
-          };
-        })
-      );
-
       setModalOpen(false);
       setDropDate(null);
       setMotivo("");
       setDraggedTrabajo(null);
+
+      await loadTrabajos();
 
       showToast("Cambio guardado correctamente.", "success");
     } catch (err: any) {
@@ -327,7 +345,9 @@ export default function Page() {
       <div className="mx-auto max-w-7xl rounded-3xl bg-white p-5 shadow-sm md:p-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-slate-800">Calendario CCT</h1>
+            <h1 className="text-3xl font-bold text-slate-800">
+              Calendario CCT
+            </h1>
             <p className="mt-1 text-sm text-slate-600">
               Drag & drop con historial resumido
             </p>
@@ -375,13 +395,17 @@ export default function Page() {
             </div>
             <div className="text-sm text-slate-600">
               Total de trabajos del mes:{" "}
-              <span className="font-semibold text-slate-800">{totalMonthJobs}</span>
+              <span className="font-semibold text-slate-800">
+                {totalMonthJobs}
+              </span>
             </div>
           </div>
 
           <div className="text-sm text-slate-600">
             Trabajos cargados:{" "}
-            <span className="font-semibold text-slate-800">{trabajos.length}</span>
+            <span className="font-semibold text-slate-800">
+              {trabajos.length}
+            </span>
           </div>
         </div>
 
@@ -412,7 +436,9 @@ export default function Page() {
                     {cell.date.getDate()}
                   </div>
                   <div className="text-xs text-slate-500">
-                    {cell.trabajos.length > 0 ? `${cell.trabajos.length} trab.` : ""}
+                    {cell.trabajos.length > 0
+                      ? `${cell.trabajos.length} trab.`
+                      : ""}
                   </div>
                 </div>
 
@@ -467,16 +493,20 @@ export default function Page() {
 
             <div className="mt-4 space-y-2 text-sm text-slate-700">
               <div>
-                <span className="font-semibold">PT:</span> {draggedTrabajo.pt || "Sin PT"}
+                <span className="font-semibold">PT:</span>{" "}
+                {draggedTrabajo.pt || "Sin PT"}
               </div>
               <div>
-                <span className="font-semibold">SSEE:</span> {draggedTrabajo.ssee || "-"}
+                <span className="font-semibold">SSEE:</span>{" "}
+                {draggedTrabajo.ssee || "-"}
               </div>
               <div>
-                <span className="font-semibold">Fecha original:</span> {draggedTrabajo.fecha}
+                <span className="font-semibold">Fecha original:</span>{" "}
+                {draggedTrabajo.fecha}
               </div>
               <div>
-                <span className="font-semibold">Fecha nueva:</span> {formatDdMmYyyy(dropDate)}
+                <span className="font-semibold">Fecha nueva:</span>{" "}
+                {formatDdMmYyyy(dropDate)}
               </div>
             </div>
 
