@@ -49,6 +49,12 @@ function truncate(text: string, max = 90) {
   return text.slice(0, max).trim() + "...";
 }
 
+function truncateSoft(text: string, max = 34) {
+  if (!text) return "-";
+  if (text.length <= max) return text;
+  return text.slice(0, max).trim() + "...";
+}
+
 function normalizeText(value: string) {
   return (value || "")
     .normalize("NFD")
@@ -128,7 +134,7 @@ function buildMonthGrid(monthDate: Date): CalendarDay[] {
 function estadoColor(estado: string) {
   if (estado === "Autorizado") {
     return {
-      background: "#e8fff1",
+      background: "#edfdf3",
       color: "#0f8a43",
       border: "#b7ebc6",
     };
@@ -136,16 +142,16 @@ function estadoColor(estado: string) {
 
   if (estado === "Suspendido") {
     return {
-      background: "#fff0f0",
+      background: "#fff1f1",
       color: "#b42318",
-      border: "#f5c2c7",
+      border: "#f3c4c4",
     };
   }
 
   return {
-    background: "#eef2ff",
+    background: "#f3f6ff",
     color: "#334155",
-    border: "#c7d2fe",
+    border: "#cdd7ff",
   };
 }
 
@@ -395,7 +401,7 @@ export default function Page() {
               type="text"
               value={busqueda}
               onChange={(e) => setBusqueda(e.target.value)}
-              placeholder="PT, subestación, componente, actividad..."
+              placeholder="PT, subestación, componente..."
               style={styles.input}
             />
           </div>
@@ -504,19 +510,27 @@ export default function Page() {
                           key={trabajo.id}
                           onClick={() => setSelectedId(trabajo.id)}
                           style={{
-                            ...styles.eventCard,
+                            ...styles.eventCardCompact,
                             background: colors.background,
                             color: colors.color,
                             border: `1px solid ${colors.border}`,
                           }}
                           title={`${trabajo.pt} · ${trabajo.subestacion} · ${trabajo.componente}`}
                         >
-                          <div style={styles.eventTime}>
+                          <div style={styles.eventCompactTime}>
                             {trabajo.horaInicio || "--:--"}
                           </div>
-                          <div style={styles.eventPt}>{trabajo.pt || "Sin PT"}</div>
-                          <div style={styles.eventSub}>
-                            {trabajo.subestacion || trabajo.componente || "-"}
+
+                          <div style={styles.eventCompactPt}>
+                            {trabajo.pt || "Sin PT"}
+                          </div>
+
+                          <div style={styles.eventCompactSub}>
+                            {truncateSoft(trabajo.subestacion || "-", 24)}
+                          </div>
+
+                          <div style={styles.eventCompactComp}>
+                            {truncateSoft(trabajo.componente || "-", 28)}
                           </div>
                         </button>
                       );
@@ -839,7 +853,7 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "center",
   },
   dayCell: {
-    minHeight: 170,
+    minHeight: 175,
     borderRight: "1px solid #e2e8f0",
     borderBottom: "1px solid #e2e8f0",
     padding: 8,
@@ -871,27 +885,39 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: "column",
     gap: 6,
   },
-  eventCard: {
+  eventCardCompact: {
     width: "100%",
     textAlign: "left",
     borderRadius: 10,
-    padding: 8,
+    padding: "7px 8px",
     cursor: "pointer",
     fontSize: 12,
+    display: "flex",
+    flexDirection: "column",
+    gap: 2,
   },
-  eventTime: {
-    fontWeight: 800,
-    marginBottom: 4,
-  },
-  eventPt: {
-    fontWeight: 700,
-    marginBottom: 2,
-    wordBreak: "break-word",
-  },
-  eventSub: {
+  eventCompactTime: {
     fontSize: 11,
-    lineHeight: 1.3,
+    fontWeight: 800,
+    lineHeight: 1.2,
+  },
+  eventCompactPt: {
+    fontSize: 12,
+    fontWeight: 800,
+    lineHeight: 1.25,
     wordBreak: "break-word",
+  },
+  eventCompactSub: {
+    fontSize: 11,
+    fontWeight: 700,
+    lineHeight: 1.25,
+    wordBreak: "break-word",
+  },
+  eventCompactComp: {
+    fontSize: 11,
+    lineHeight: 1.25,
+    wordBreak: "break-word",
+    opacity: 0.95,
   },
   moreItems: {
     fontSize: 12,
