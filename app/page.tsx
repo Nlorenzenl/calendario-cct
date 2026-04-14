@@ -89,12 +89,13 @@ type EditPTForm = {
 
 type HistoryItem = {
   id: string;
-  tipo: "reprogramacion" | "suspension";
+  tipo: "reprogramacion" | "suspension" | "acople";
   pt: string;
   fechaOrigen: string;
   fechaDestino: string;
   motivo: string;
   timestamp: string;
+  detalle?: string;
 };
 
 type ToastState = {
@@ -113,11 +114,26 @@ type CenAlertItem = {
   motivo: "4_dias_habiles" | "12_dias_corridos";
 };
 
+type AcopleGroup = {
+  id: string;
+  leaderId: string;
+  memberIds: string[];
+  createdAt: string;
+};
+
+type DayOverflowState = {
+  open: boolean;
+  date: string;
+};
+
 type EssentialPattern = {
   source: string;
   category: "barra" | "lltt" | "transformador";
   tokens: string[];
 };
+
+const LS_ACOPLES_KEY = "cct_acoples_v1";
+const LS_HISTORIAL_KEY = "cct_historial_v1";
 
 const CHILE_HOLIDAYS_2026 = [
   "2026-01-01",
@@ -248,6 +264,7 @@ const COMMON_STOPWORDS = new Set([
   "ur",
   "urc",
   "tap",
+  "cto",
 ]);
 
 function truncate(text: string, max = 90) {
@@ -477,9 +494,12 @@ function tokenizeForEssential(value: string) {
   const normalized = normalizeText(value)
     .replace(/\bs\/e\b/g, " se ")
     .replace(/\bcto\b/g, " circuito ")
+    .replace(/\bctos\b/g, " circuito ")
     .replace(/\bint\b/g, " interruptor ")
     .replace(/\btr\b/g, " transformador ")
     .replace(/\batr\b/g, " atr ")
+    .replace(/\bn°/g, " n ")
+    .replace(/\bnº/g, " n ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -520,11 +540,89 @@ const ESSENTIAL_PATTERNS = buildEssentialPatterns();
 function countMatches(tokens: string[], haystack: string) {
   let matches = 0;
   for (const token of tokens) {
-    if (haystack.includes(token)) {
+    if (haystack.includes(` ${token} `)) {
       matches += 1;
     }
   }
   return matches;
+}
+
+function detectFlexibleEssentialByRules(trabajo: TrabajoUI) {
+  const haystack = ` ${tokenizeForEssential(
+    [
+      trabajo.subestacion,
+      trabajo.componente,
+      trabajo.actividad,
+      trabajo.tipo,
+      trabajo.observacion,
+    ].join(" ")
+  ).join(" ")} `;
+
+  const hasVoltage =
+    haystack.includes(" 110 ") ||
+    haystack.includes(" 220 ") ||
+    haystack.includes(" 154 ") ||
+    haystack.includes(" 66 ");
+
+  const hasLineWord =
+    haystack.includes(" circuito ") ||
+    haystack.includes(" linea ") ||
+    haystack.includes(" interruptor ");
+
+  const hasTransformerWord =
+    haystack.includes(" atr ") ||
+    haystack.includes(" transformador ") ||
+    haystack.includes(" t1 ") ||
+    haystack.includes(" t2 ") ||
+    haystack.includes(" n1 ") ||
+    haystack.includes(" n2 ");
+
+  if (hasVoltage && hasLineWord) {
+    const matchedSubstations = [
+      "chena",
+      "navia",
+      "cerro",
+      "salto",
+      "florida",
+      "almendros",
+      "buin",
+      "malloco",
+      "san",
+      "bernardo",
+      "ochagavia",
+      "polpaico",
+      "kapatur",
+      "ohiggins",
+      "rahu e",
+      "pilauco",
+      "antillanca",
+      "pichirropulli",
+      "pargua",
+      "chiloe",
+      "puerto",
+      "montt",
+      "llanquihue",
+      "nueva",
+      "ancud",
+      "alto",
+      "jahuel",
+      "melipulli",
+      "vitacura",
+      "apoquindo",
+      "brasil",
+      "macul",
+    ].filter((name) => haystack.includes(` ${name} `));
+
+    if (matchedSubstations.length >= 2) {
+      return true;
+    }
+  }
+
+  if (hasTransformerWord && hasVoltage) {
+    return true;
+  }
+
+  return false;
 }
 
 function isEssentialInstallation(trabajo: TrabajoUI) {
@@ -541,6 +639,7 @@ function isEssentialInstallation(trabajo: TrabajoUI) {
   const hasLineHint =
     haystack.includes(" linea ") ||
     haystack.includes(" circuito ") ||
+    haystack.includes(" interruptor ") ||
     haystack.includes(" 110 ") ||
     haystack.includes(" 220 ") ||
     haystack.includes(" 154 ");
@@ -563,7 +662,7 @@ function isEssentialInstallation(trabajo: TrabajoUI) {
   for (const pattern of ESSENTIAL_PATTERNS) {
     const matches = countMatches(pattern.tokens, haystack);
 
-    if (pattern.category === "lltt" && hasLineHint && matches >= 3) {
+    if (pattern.category === "lltt" && hasLineHint && matches >= 2) {
       return true;
     }
 
@@ -576,7 +675,7 @@ function isEssentialInstallation(trabajo: TrabajoUI) {
     }
   }
 
-  return false;
+  return detectFlexibleEssentialByRules(trabajo);
 }
 
 function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
@@ -624,6 +723,91 @@ function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
   return { normal, essential, effectiveToday };
 }
 
+function getLeaderGroupForTrabajo(trabajoId: string, groups: AcopleGroup[]) {
+  return groups.find(
+    (g) => g.leaderId === trabajoId || g.memberIds.includes(trabajoId)
+  );
+}
+
+function groupTrabajosByAcoples(trabajos: TrabajoUI[], groups: AcopleGroup[]) {
+  const mapById = new Map(trabajos.map((t) => [t.id, t]));
+  const alreadyGrouped = new Set<string>();
+
+  const result: Array<{
+    kind: "single" | "group";
+    leader: TrabajoUI;
+    members: TrabajoUI[];
+    groupId?: string;
+  }> = [];
+
+  for (const t of trabajos) {
+    if (alreadyGrouped.has(t.id)) continue;
+
+    const group = groups.find((g) => g.leaderId === t.id);
+
+    if (group) {
+      const members = [t, ...group.memberIds.map((id) => mapById.get(id)).filter(Boolean)] as TrabajoUI[];
+      members.forEach((m) => alreadyGrouped.add(m.id));
+      result.push({
+        kind: "group",
+        leader: t,
+        members,
+        groupId: group.id,
+      });
+      continue;
+    }
+
+    const belongsAsMember = groups.some((g) => g.memberIds.includes(t.id));
+    if (belongsAsMember) {
+      alreadyGrouped.add(t.id);
+      continue;
+    }
+
+    alreadyGrouped.add(t.id);
+    result.push({
+      kind: "single",
+      leader: t,
+      members: [t],
+    });
+  }
+
+  return result;
+}
+
+function loadAcoplesFromStorage(): AcopleGroup[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(LS_ACOPLES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAcoplesToStorage(acoples: AcopleGroup[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(LS_ACOPLES_KEY, JSON.stringify(acoples));
+}
+
+function loadHistorialFromStorage(): HistoryItem[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(LS_HISTORIAL_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistorialToStorage(historial: HistoryItem[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(LS_HISTORIAL_KEY, JSON.stringify(historial));
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -650,6 +834,7 @@ export default function Page() {
   });
 
   const [historial, setHistorial] = useState<HistoryItem[]>([]);
+  const [acoples, setAcoples] = useState<AcopleGroup[]>([]);
 
   const [draggingId, setDraggingId] = useState<string>("");
   const [dropTargetDate, setDropTargetDate] = useState<string>("");
@@ -667,12 +852,31 @@ export default function Page() {
   const [suspensionReasonError, setSuspensionReasonError] = useState("");
   const [pendingSuspensionSave, setPendingSuspensionSave] = useState(false);
 
+  const [dayOverflow, setDayOverflow] = useState<DayOverflowState>({
+    open: false,
+    date: "",
+  });
+  const [acopleTargetId, setAcopleTargetId] = useState<string>("");
+
   const now = new Date();
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
   );
     useEffect(() => {
+    setAcoples(loadAcoplesFromStorage());
+    setHistorial(loadHistorialFromStorage());
+  }, []);
+
+  useEffect(() => {
+    saveAcoplesToStorage(acoples);
+  }, [acoples]);
+
+  useEffect(() => {
+    saveHistorialToStorage(historial);
+  }, [historial]);
+
+  useEffect(() => {
     if (!toast.visible) return;
     const timer = setTimeout(() => {
       setToast({ visible: false, message: "" });
@@ -794,6 +998,24 @@ export default function Page() {
     }
     return map;
   }, [trabajosFiltrados]);
+
+  const gruposPorFecha = useMemo(() => {
+    const map = new Map<
+      string,
+      Array<{
+        kind: "single" | "group";
+        leader: TrabajoUI;
+        members: TrabajoUI[];
+        groupId?: string;
+      }>
+    >();
+
+    for (const [fecha, items] of trabajosPorFecha.entries()) {
+      map.set(fecha, groupTrabajosByAcoples(items, acoples));
+    }
+
+    return map;
+  }, [trabajosPorFecha, acoples]);
 
   const diasMes = useMemo(() => buildMonthGrid(monthCursor), [monthCursor]);
 
@@ -976,9 +1198,134 @@ export default function Page() {
     setDraggingId(trabajoId);
   };
 
+  const onDragStartAcople = (trabajoId: string) => {
+    setDraggingId(trabajoId);
+  };
+
+  const onDragEnterTrabajoCard = (trabajoId: string) => {
+    if (!draggingId || draggingId === trabajoId) return;
+    setAcopleTargetId(trabajoId);
+  };
+
+  const onDragLeaveTrabajoCard = (trabajoId: string) => {
+    if (acopleTargetId === trabajoId) {
+      setAcopleTargetId("");
+    }
+  };
+
+  const onDropSobreTrabajo = (
+    targetTrabajoId: string,
+    e: React.DragEvent<HTMLButtonElement>
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!draggingId || draggingId === targetTrabajoId) {
+      setAcopleTargetId("");
+      return;
+    }
+
+    const dragged = trabajos.find((t) => t.id === draggingId);
+    const target = trabajos.find((t) => t.id === targetTrabajoId);
+
+    if (!dragged || !target) {
+      setAcopleTargetId("");
+      return;
+    }
+
+    if (dragged.fecha !== target.fecha) {
+      setAcopleTargetId("");
+      mostrarToast("Solo puedes acoplar trabajos del mismo día");
+      return;
+    }
+
+    const draggedGroup = getLeaderGroupForTrabajo(draggingId, acoples);
+    const targetGroup = getLeaderGroupForTrabajo(targetTrabajoId, acoples);
+
+    if (draggedGroup && targetGroup && draggedGroup.id === targetGroup.id) {
+      setAcopleTargetId("");
+      return;
+    }
+
+    let nextAcoples = [...acoples];
+
+    if (draggedGroup) {
+      nextAcoples = nextAcoples.filter((g) => g.id !== draggedGroup.id);
+    }
+
+    if (targetGroup) {
+      nextAcoples = nextAcoples.filter((g) => g.id !== targetGroup.id);
+    }
+
+    const mergedMemberIds = new Set<string>();
+
+    if (targetGroup) {
+      mergedMemberIds.add(targetGroup.leaderId);
+      targetGroup.memberIds.forEach((id) => mergedMemberIds.add(id));
+    } else {
+      mergedMemberIds.add(targetTrabajoId);
+    }
+
+    if (draggedGroup) {
+      mergedMemberIds.add(draggedGroup.leaderId);
+      draggedGroup.memberIds.forEach((id) => mergedMemberIds.add(id));
+    } else {
+      mergedMemberIds.add(draggingId);
+    }
+
+    mergedMemberIds.delete(targetTrabajoId);
+
+    nextAcoples.push({
+      id: `acople-${Date.now()}`,
+      leaderId: targetTrabajoId,
+      memberIds: Array.from(mergedMemberIds),
+      createdAt: new Date().toISOString(),
+    });
+
+    setAcoples(nextAcoples);
+
+    setHistorial((prev) => [
+      {
+        id: `hist-acople-${Date.now()}`,
+        tipo: "acople",
+        pt: target.pt,
+        fechaOrigen: target.fecha,
+        fechaDestino: target.fecha,
+        motivo: "Acoplamiento manual en calendario",
+        timestamp: formatTimestamp(new Date()),
+        detalle: `${dragged.pt} acoplado con ${target.pt}`,
+      },
+      ...prev,
+    ]);
+
+    setDraggingId("");
+    setDropTargetDate("");
+    setAcopleTargetId("");
+    mostrarToast("PTs acoplados en la agenda");
+  };
+
+  const desacoplarGrupo = (groupId: string, leaderPt: string, fecha: string) => {
+    setAcoples((prev) => prev.filter((g) => g.id !== groupId));
+    setHistorial((prev) => [
+      {
+        id: `hist-desacople-${Date.now()}`,
+        tipo: "acople",
+        pt: leaderPt,
+        fechaOrigen: fecha,
+        fechaDestino: fecha,
+        motivo: "Desacople manual en calendario",
+        timestamp: formatTimestamp(new Date()),
+        detalle: `Se eliminó acople visual del grupo ${groupId}`,
+      },
+      ...prev,
+    ]);
+    mostrarToast("Acople eliminado");
+  };
+
   const onDragEndTrabajo = () => {
     setDraggingId("");
     setDropTargetDate("");
+    setAcopleTargetId("");
   };
 
   const onDragOverDay = (
@@ -1018,6 +1365,7 @@ export default function Page() {
     setMoveReasonOpen(true);
     setDraggingId("");
     setDropTargetDate("");
+    setAcopleTargetId("");
   };
 
   const cerrarMoveReasonModal = () => {
@@ -1267,12 +1615,17 @@ export default function Page() {
       (t) =>
         t.pt === item.pt &&
         t.fecha === item.fecha &&
-        normalizeText(t.subestacion) === normalizeText(item.subestacion)
+        (normalizeText(t.subestacion) === normalizeText(item.subestacion) ||
+          normalizeText(t.componente) === normalizeText(item.componente))
     );
 
     if (found) {
       setSelectedId(found.id);
     }
+  };
+
+  const cerrarDayOverflow = () => {
+    setDayOverflow({ open: false, date: "" });
   };
 
   return (
@@ -1501,7 +1854,7 @@ export default function Page() {
             <div style={styles.weekHeader}>Sáb</div>
             <div style={styles.weekHeader}>Dom</div>
                         {diasMes.map((day) => {
-              const items = trabajosPorFecha.get(day.iso) || [];
+              const groupedItems = gruposPorFecha.get(day.iso) || [];
               const isToday = day.iso === toLocalDateInputValue(today);
               const isDropTarget = dropTargetDate === day.iso && draggingId;
 
@@ -1542,14 +1895,102 @@ export default function Page() {
                       </span>
                     </button>
 
-                    {items.length > 0 && (
-                      <span style={styles.dayCount}>{items.length}</span>
+                    {groupedItems.length > 0 && (
+                      <span style={styles.dayCount}>{groupedItems.length}</span>
                     )}
                   </div>
 
                   <div style={styles.dayItems}>
-                    {items.slice(0, 4).map((trabajo) => {
+                    {groupedItems.slice(0, 4).map((entry) => {
+                      const trabajo = entry.leader;
                       const colors = estadoColor(trabajo.estado);
+                      const isAcopleTarget = acopleTargetId === trabajo.id;
+
+                      if (entry.kind === "group") {
+                        return (
+                          <div
+                            key={entry.groupId}
+                            style={{
+                              ...styles.groupCard,
+                              background: colors.background,
+                              border: `1px solid ${colors.border}`,
+                              boxShadow: isAcopleTarget
+                                ? "0 0 0 2px rgba(251,191,36,0.35)"
+                                : "none",
+                            }}
+                          >
+                            <button
+                              type="button"
+                              draggable
+                              onDragStart={() => onDragStartAcople(trabajo.id)}
+                              onDragEnd={onDragEndTrabajo}
+                              onDragEnter={() => onDragEnterTrabajoCard(trabajo.id)}
+                              onDragLeave={() => onDragLeaveTrabajoCard(trabajo.id)}
+                              onDragOver={(e) => e.preventDefault()}
+                              onDrop={(e) => onDropSobreTrabajo(trabajo.id, e)}
+                              onClick={() => setSelectedId(trabajo.id)}
+                              style={{
+                                ...styles.eventCardCompact,
+                                background: "transparent",
+                                color: colors.color,
+                                border: "none",
+                                padding: 0,
+                              }}
+                              title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
+                            >
+                              <div style={styles.groupHeaderRow}>
+                                <div style={styles.eventCompactSub}>
+                                  {truncateSoft(trabajo.subestacion || "-", 24)}
+                                </div>
+                                <span style={styles.groupBadge}>
+                                  {entry.members.length} PT
+                                </span>
+                              </div>
+
+                              <div style={styles.eventCompactPt}>
+                                {trabajo.pt || "Sin PT"}
+                              </div>
+
+                              <div style={styles.eventCompactComp}>
+                                {truncateSoft(trabajo.componente || "-", 28)}
+                              </div>
+                            </button>
+
+                            <div style={styles.groupMembers}>
+                              {entry.members.slice(1).map((m) => (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => setSelectedId(m.id)}
+                                  style={styles.groupMemberButton}
+                                  title={`${m.subestacion} · ${m.pt} · ${m.componente}`}
+                                >
+                                  <div style={styles.groupMemberPt}>{m.pt}</div>
+                                  <div style={styles.groupMemberComp}>
+                                    {truncateSoft(m.componente || m.actividad || "-", 24)}
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+
+                            <div style={styles.groupActions}>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  desacoplarGrupo(
+                                    entry.groupId || "",
+                                    trabajo.pt,
+                                    trabajo.fecha
+                                  )
+                                }
+                                style={styles.unlinkButton}
+                              >
+                                Desacoplar
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      }
 
                       return (
                         <button
@@ -1557,6 +1998,10 @@ export default function Page() {
                           draggable
                           onDragStart={() => onDragStartTrabajo(trabajo.id)}
                           onDragEnd={onDragEndTrabajo}
+                          onDragEnter={() => onDragEnterTrabajoCard(trabajo.id)}
+                          onDragLeave={() => onDragLeaveTrabajoCard(trabajo.id)}
+                          onDragOver={(e) => e.preventDefault()}
+                          onDrop={(e) => onDropSobreTrabajo(trabajo.id, e)}
                           onClick={() => setSelectedId(trabajo.id)}
                           style={{
                             ...styles.eventCardCompact,
@@ -1564,6 +2009,9 @@ export default function Page() {
                             color: colors.color,
                             border: `1px solid ${colors.border}`,
                             opacity: draggingId === trabajo.id ? 0.55 : 1,
+                            boxShadow: isAcopleTarget
+                              ? "0 0 0 2px rgba(251,191,36,0.35)"
+                              : "none",
                           }}
                           title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
                         >
@@ -1582,10 +2030,14 @@ export default function Page() {
                       );
                     })}
 
-                    {items.length > 4 && (
-                      <div style={styles.moreItems}>
-                        +{items.length - 4} trabajo(s) más
-                      </div>
+                    {groupedItems.length > 4 && (
+                      <button
+                        type="button"
+                        onClick={() => setDayOverflow({ open: true, date: day.iso })}
+                        style={styles.moreItemsButton}
+                      >
+                        +{groupedItems.length - 4} trabajo(s) más
+                      </button>
                     )}
                   </div>
                 </div>
@@ -1670,6 +2122,7 @@ export default function Page() {
                 <th style={styles.th}>Fecha origen</th>
                 <th style={styles.th}>Fecha destino</th>
                 <th style={styles.th}>Motivo</th>
+                <th style={styles.th}>Detalle</th>
                 <th style={styles.th}>Fecha registro</th>
               </tr>
             </thead>
@@ -1679,12 +2132,15 @@ export default function Page() {
                   <td style={styles.td}>
                     {item.tipo === "reprogramacion"
                       ? "Reprogramación"
-                      : "Suspensión"}
+                      : item.tipo === "suspension"
+                      ? "Suspensión"
+                      : "Acople"}
                   </td>
                   <td style={styles.td}>{item.pt}</td>
                   <td style={styles.td}>{item.fechaOrigen}</td>
                   <td style={styles.td}>{item.fechaDestino}</td>
                   <td style={styles.td}>{item.motivo}</td>
+                  <td style={styles.td}>{item.detalle || "-"}</td>
                   <td style={styles.td}>{item.timestamp}</td>
                 </tr>
               ))}
@@ -2155,6 +2611,87 @@ export default function Page() {
         </div>
       )}
 
+      {dayOverflow.open && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Trabajos del día</h2>
+                <div style={styles.modalSubtitle}>{dayOverflow.date}</div>
+              </div>
+
+              <button onClick={cerrarDayOverflow} style={styles.closeButton}>
+                ✕
+              </button>
+            </div>
+
+            <div style={styles.overflowList}>
+              {(gruposPorFecha.get(dayOverflow.date) || []).map((entry, idx) => {
+                if (entry.kind === "group") {
+                  return (
+                    <div key={entry.groupId || idx} style={styles.overflowGroup}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedId(entry.leader.id);
+                          cerrarDayOverflow();
+                        }}
+                        style={styles.overflowLeader}
+                      >
+                        <div style={styles.overflowLeaderPt}>
+                          {entry.leader.pt} · {entry.leader.subestacion || "-"}
+                        </div>
+                        <div style={styles.overflowLeaderComp}>
+                          {truncate(entry.leader.componente || entry.leader.actividad || "-", 80)}
+                        </div>
+                      </button>
+
+                      <div style={styles.overflowMembers}>
+                        {entry.members.slice(1).map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedId(m.id);
+                              cerrarDayOverflow();
+                            }}
+                            style={styles.overflowMember}
+                          >
+                            <div style={styles.overflowMemberPt}>{m.pt}</div>
+                            <div style={styles.overflowMemberComp}>
+                              {truncate(m.componente || m.actividad || "-", 70)}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <button
+                    key={entry.leader.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedId(entry.leader.id);
+                      cerrarDayOverflow();
+                    }}
+                    style={styles.overflowSingle}
+                  >
+                    <div style={styles.overflowLeaderPt}>
+                      {entry.leader.pt} · {entry.leader.subestacion || "-"}
+                    </div>
+                    <div style={styles.overflowLeaderComp}>
+                      {truncate(entry.leader.componente || entry.leader.actividad || "-", 80)}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast.visible && <div style={styles.toast}>{toast.message}</div>}
     </main>
   );
@@ -2564,11 +3101,15 @@ const styles: Record<string, React.CSSProperties> = {
     wordBreak: "break-word",
     opacity: 0.95,
   },
-  moreItems: {
+  moreItemsButton: {
     fontSize: 12,
     color: "#64748b",
-    padding: "2px 4px",
+    padding: "4px 6px",
     fontWeight: 700,
+    border: "none",
+    background: "transparent",
+    textAlign: "left",
+    cursor: "pointer",
   },
   tableWrap: {
     background: "#fff",
@@ -2696,5 +3237,127 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     boxShadow: "0 10px 30px rgba(22, 163, 74, 0.35)",
     zIndex: 1200,
+  },
+  groupCard: {
+    borderRadius: 10,
+    padding: 8,
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  groupHeaderRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+  },
+  groupBadge: {
+    fontSize: 10,
+    fontWeight: 800,
+    borderRadius: 999,
+    background: "rgba(15,23,42,0.08)",
+    color: "#0f172a",
+    padding: "2px 8px",
+    whiteSpace: "nowrap",
+  },
+  groupMembers: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+  },
+  groupMemberButton: {
+    border: "1px dashed #cbd5e1",
+    background: "rgba(255,255,255,0.7)",
+    borderRadius: 8,
+    padding: "5px 6px",
+    textAlign: "left",
+    cursor: "pointer",
+  },
+  groupMemberPt: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  groupMemberComp: {
+    fontSize: 10,
+    color: "#475569",
+    marginTop: 2,
+    lineHeight: 1.2,
+  },
+  groupActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+  },
+  unlinkButton: {
+    border: "none",
+    background: "transparent",
+    color: "#b42318",
+    fontSize: 11,
+    fontWeight: 700,
+    cursor: "pointer",
+    padding: 0,
+  },
+  overflowList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  overflowGroup: {
+    border: "1px solid #e2e8f0",
+    borderRadius: 12,
+    padding: 10,
+    background: "#f8fafc",
+  },
+  overflowLeader: {
+    width: "100%",
+    textAlign: "left",
+    border: "none",
+    background: "#fff",
+    borderRadius: 10,
+    padding: 10,
+    cursor: "pointer",
+  },
+  overflowLeaderPt: {
+    fontSize: 13,
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  overflowLeaderComp: {
+    fontSize: 12,
+    color: "#475569",
+    marginTop: 4,
+  },
+  overflowMembers: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    marginTop: 8,
+    paddingLeft: 10,
+  },
+  overflowMember: {
+    textAlign: "left",
+    border: "1px dashed #cbd5e1",
+    background: "#fff",
+    borderRadius: 10,
+    padding: 8,
+    cursor: "pointer",
+  },
+  overflowMemberPt: {
+    fontSize: 12,
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  overflowMemberComp: {
+    fontSize: 11,
+    color: "#475569",
+    marginTop: 3,
+  },
+  overflowSingle: {
+    textAlign: "left",
+    border: "1px solid #e2e8f0",
+    background: "#fff",
+    borderRadius: 12,
+    padding: 10,
+    cursor: "pointer",
   },
 };
