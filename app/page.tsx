@@ -113,6 +113,12 @@ type CenAlertItem = {
   motivo: "4_dias_habiles" | "12_dias_corridos";
 };
 
+type EssentialPattern = {
+  source: string;
+  category: "barra" | "lltt" | "transformador";
+  tokens: string[];
+};
+
 const CHILE_HOLIDAYS_2026 = [
   "2026-01-01",
   "2026-04-03",
@@ -214,6 +220,36 @@ const ESSENTIAL_TRANSFORMERS = [
   "VALDIVIA 230/69/13,8KV 60MVA T4",
 ];
 
+const COMMON_STOPWORDS = new Set([
+  "s",
+  "se",
+  "e",
+  "de",
+  "del",
+  "la",
+  "el",
+  "los",
+  "las",
+  "y",
+  "en",
+  "con",
+  "para",
+  "por",
+  "ba",
+  "kv",
+  "mva",
+  "stm",
+  "sts",
+  "ii",
+  "iii",
+  "bp",
+  "n",
+  "no",
+  "ur",
+  "urc",
+  "tap",
+]);
+
 function truncate(text: string, max = 90) {
   if (!text) return "-";
   if (text.length <= max) return text;
@@ -230,6 +266,11 @@ function normalizeText(value: string) {
   return (value || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[()]/g, " ")
+    .replace(/[\/]/g, " ")
+    .replace(/-/g, " ")
+    .replace(/,/g, " ")
+    .replace(/\./g, " ")
     .toLowerCase()
     .trim();
 }
@@ -365,9 +406,8 @@ function buildEditForm(trabajo: TrabajoUI): EditPTForm {
   };
 }
 
-function isNumericAvisoReal(value: string) {
-  const v = (value || "").trim();
-  return /^\d{8,}$/.test(v);
+function containsCenCorrelativo(value: string) {
+  return /\d{8,}/.test(value || "");
 }
 
 function requiresCenReview(trabajo: TrabajoUI) {
@@ -378,7 +418,7 @@ function requiresCenReview(trabajo: TrabajoUI) {
   if (!aviso) return true;
   if (aviso === "pendiente") return true;
   if (aviso === "no requiere") return false;
-  if (isNumericAvisoReal(trabajo.aviso)) return false;
+  if (containsCenCorrelativo(trabajo.aviso)) return false;
 
   return true;
 }
@@ -433,31 +473,110 @@ function sameDate(a: Date, b: Date) {
   return toLocalDateInputValue(a) === toLocalDateInputValue(b);
 }
 
-function normalizeForEssentialMatch(value: string) {
-  return normalizeText(value)
-    .replace(/s\/e/g, "se")
+function tokenizeForEssential(value: string) {
+  const normalized = normalizeText(value)
+    .replace(/\bs\/e\b/g, " se ")
+    .replace(/\bcto\b/g, " circuito ")
+    .replace(/\bint\b/g, " interruptor ")
+    .replace(/\btr\b/g, " transformador ")
+    .replace(/\batr\b/g, " atr ")
     .replace(/\s+/g, " ")
     .trim();
+
+  const rawTokens = normalized.split(" ").filter(Boolean);
+
+  return rawTokens.filter((token) => {
+    if (COMMON_STOPWORDS.has(token)) return false;
+    if (/^\d+$/.test(token)) return true;
+    if (token.length <= 1) return false;
+    return true;
+  });
 }
 
-function buildEssentialNeedles() {
-  const all = [...ESSENTIAL_BARRAS, ...ESSENTIAL_LLTT, ...ESSENTIAL_TRANSFORMERS];
-  return all.map((item) => normalizeForEssentialMatch(item));
+function buildEssentialPatterns(): EssentialPattern[] {
+  const barras = ESSENTIAL_BARRAS.map((source) => ({
+    source,
+    category: "barra" as const,
+    tokens: tokenizeForEssential(source),
+  }));
+
+  const lltt = ESSENTIAL_LLTT.map((source) => ({
+    source,
+    category: "lltt" as const,
+    tokens: tokenizeForEssential(source),
+  }));
+
+  const transformadores = ESSENTIAL_TRANSFORMERS.map((source) => ({
+    source,
+    category: "transformador" as const,
+    tokens: tokenizeForEssential(source),
+  }));
+
+  return [...barras, ...lltt, ...transformadores];
 }
 
-const ESSENTIAL_NEEDLES = buildEssentialNeedles();
+const ESSENTIAL_PATTERNS = buildEssentialPatterns();
+
+function countMatches(tokens: string[], haystack: string) {
+  let matches = 0;
+  for (const token of tokens) {
+    if (haystack.includes(token)) {
+      matches += 1;
+    }
+  }
+  return matches;
+}
 
 function isEssentialInstallation(trabajo: TrabajoUI) {
-  const haystack = normalizeForEssentialMatch(
+  const haystack = ` ${tokenizeForEssential(
     [
       trabajo.subestacion,
       trabajo.componente,
       trabajo.actividad,
       trabajo.tipo,
+      trabajo.observacion,
     ].join(" ")
-  );
+  ).join(" ")} `;
 
-  return ESSENTIAL_NEEDLES.some((needle) => haystack.includes(needle));
+  const hasLineHint =
+    haystack.includes(" linea ") ||
+    haystack.includes(" circuito ") ||
+    haystack.includes(" 110 ") ||
+    haystack.includes(" 220 ") ||
+    haystack.includes(" 154 ");
+
+  const hasTransformerHint =
+    haystack.includes(" atr ") ||
+    haystack.includes(" transformador ") ||
+    haystack.includes(" t1 ") ||
+    haystack.includes(" t2 ") ||
+    haystack.includes(" n1 ") ||
+    haystack.includes(" n2 ");
+
+  const hasBarraHint =
+    haystack.includes(" barra ") ||
+    haystack.includes(" bp1 ") ||
+    haystack.includes(" bp2 ") ||
+    haystack.includes(" b1 ") ||
+    haystack.includes(" b2 ");
+
+  for (const pattern of ESSENTIAL_PATTERNS) {
+    const matches = countMatches(pattern.tokens, haystack);
+
+    if (pattern.category === "lltt" && hasLineHint && matches >= 3) {
+      return true;
+    }
+
+    if (pattern.category === "transformador" && hasTransformerHint && matches >= 2) {
+      return true;
+    }
+
+    if (pattern.category === "barra" && (hasBarraHint || hasLineHint) && matches >= 2) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
@@ -708,6 +827,36 @@ export default function Page() {
     setNewPTError("");
     setNewPTForm(emptyNewPTForm(fecha));
     setNewPTOpen(true);
+  };
+
+  const abrirCopiaDesdeTrabajo = (trabajo: TrabajoUI) => {
+    setSelectedId("");
+    setEditError("");
+    setNewPTError("");
+    setNewPTForm({
+      pt: "",
+      fecha: trabajo.fecha || "",
+      horaInicio: trabajo.horaInicio || "08:00",
+      horaFin: trabajo.horaFin || "18:00",
+      subestacion: trabajo.subestacion || "",
+      componente: trabajo.componente || "",
+      actividad: trabajo.actividad || "",
+      observacion: trabajo.observacion || "",
+      estado: trabajo.estado || "En programación",
+      tipo: trabajo.tipo || "DESCONEXIÓN",
+      programador: trabajo.programador || "",
+      aviso: trabajo.aviso || "",
+      sodi: trabajo.sodi || "",
+    });
+    setNewPTOpen(true);
+  };
+
+  const duplicarFormularioNuevo = () => {
+    setNewPTForm((prev) => ({
+      ...prev,
+      pt: "",
+    }));
+    mostrarToast("Formulario duplicado. Ingresa el nuevo PT");
   };
 
   const cerrarNuevoPT = () => {
@@ -1109,6 +1258,23 @@ export default function Page() {
     await ejecutarGuardadoEdicion();
   };
 
+  const irAlTrabajoDesdeAlerta = (item: CenAlertItem) => {
+    const targetDate = parseISODateLocal(item.fecha);
+    setVista("calendario");
+    setMonthCursor(new Date(targetDate.getFullYear(), targetDate.getMonth(), 1));
+
+    const found = trabajos.find(
+      (t) =>
+        t.pt === item.pt &&
+        t.fecha === item.fecha &&
+        normalizeText(t.subestacion) === normalizeText(item.subestacion)
+    );
+
+    if (found) {
+      setSelectedId(found.id);
+    }
+  };
+
   return (
     <main style={styles.page}>
       <div style={styles.header}>
@@ -1157,9 +1323,7 @@ export default function Page() {
                   Último día operativo: {toLocalDateInputValue(cenAlerts.effectiveToday)}
                 </div>
               </div>
-              <div style={styles.alertCount}>
-                {cenAlerts.normal.length}
-              </div>
+              <div style={styles.alertCount}>{cenAlerts.normal.length}</div>
             </div>
 
             {cenAlerts.normal.length === 0 ? (
@@ -1169,15 +1333,22 @@ export default function Page() {
             ) : (
               <div style={styles.alertList}>
                 {cenAlerts.normal.slice(0, 6).map((item) => (
-                  <div key={item.id} style={styles.alertItem}>
-                    <div style={styles.alertItemPt}>{item.pt}</div>
-                    <div style={styles.alertItemMeta}>
-                      {item.fecha} · {item.subestacion || "-"}
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => irAlTrabajoDesdeAlerta(item)}
+                    style={styles.alertItemButton}
+                  >
+                    <div style={styles.alertItem}>
+                      <div style={styles.alertItemPt}>{item.pt}</div>
+                      <div style={styles.alertItemMeta}>
+                        {item.fecha} · {item.subestacion || "-"}
+                      </div>
+                      <div style={styles.alertItemDesc}>
+                        {truncate(item.componente || item.actividad || "-", 80)}
+                      </div>
                     </div>
-                    <div style={styles.alertItemDesc}>
-                      {truncate(item.componente || item.actividad || "-", 80)}
-                    </div>
-                  </div>
+                  </button>
                 ))}
                 {cenAlerts.normal.length > 6 && (
                   <div style={styles.alertMore}>
@@ -1208,15 +1379,22 @@ export default function Page() {
             ) : (
               <div style={styles.alertList}>
                 {cenAlerts.essential.slice(0, 6).map((item) => (
-                  <div key={item.id} style={styles.alertItem}>
-                    <div style={styles.alertItemPt}>{item.pt}</div>
-                    <div style={styles.alertItemMeta}>
-                      {item.fecha} · {item.subestacion || "-"}
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => irAlTrabajoDesdeAlerta(item)}
+                    style={styles.alertItemButton}
+                  >
+                    <div style={styles.alertItem}>
+                      <div style={styles.alertItemPt}>{item.pt}</div>
+                      <div style={styles.alertItemMeta}>
+                        {item.fecha} · {item.subestacion || "-"}
+                      </div>
+                      <div style={styles.alertItemDesc}>
+                        {truncate(item.componente || item.actividad || "-", 80)}
+                      </div>
                     </div>
-                    <div style={styles.alertItemDesc}>
-                      {truncate(item.componente || item.actividad || "-", 80)}
-                    </div>
-                  </div>
+                  </button>
                 ))}
                 {cenAlerts.essential.length > 6 && (
                   <div style={styles.alertMore}>
@@ -1665,6 +1843,13 @@ export default function Page() {
             </div>
 
             <div style={styles.modalActions}>
+              <button
+                onClick={() => abrirCopiaDesdeTrabajo(trabajoSeleccionado)}
+                style={styles.secondaryButton}
+              >
+                Copiar trabajo
+              </button>
+
               <button onClick={cerrarModal} style={styles.secondaryButton}>
                 Cerrar
               </button>
@@ -1834,6 +2019,10 @@ export default function Page() {
             </div>
 
             <div style={styles.modalActions}>
+              <button onClick={duplicarFormularioNuevo} style={styles.secondaryButton}>
+                Duplicar borrando PT
+              </button>
+
               <button onClick={cerrarNuevoPT} style={styles.secondaryButton}>
                 Cancelar
               </button>
@@ -2132,6 +2321,14 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     gap: 8,
+  },
+  alertItemButton: {
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    margin: 0,
+    textAlign: "left",
+    cursor: "pointer",
   },
   alertItem: {
     border: "1px solid #e2e8f0",
