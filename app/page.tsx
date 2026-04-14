@@ -289,6 +289,11 @@ export default function Page() {
     toDate: string;
   } | null>(null);
 
+  const [suspensionReasonOpen, setSuspensionReasonOpen] = useState(false);
+  const [suspensionReason, setSuspensionReason] = useState("");
+  const [suspensionReasonError, setSuspensionReasonError] = useState("");
+  const [pendingSuspensionSave, setPendingSuspensionSave] = useState(false);
+
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
@@ -437,6 +442,7 @@ export default function Page() {
   };
 
   const cerrarModal = () => {
+    if (updatingDetail) return;
     setSelectedId("");
   };
 
@@ -701,11 +707,15 @@ export default function Page() {
     }
   };
 
-  const updateEditField = (field: keyof EditPTForm, value: string) => {
-    setEditForm((prev) => (prev ? { ...prev, [field]: value } : prev));
+  const cerrarSuspensionReasonModal = () => {
+    if (updatingDetail) return;
+    setSuspensionReasonOpen(false);
+    setSuspensionReason("");
+    setSuspensionReasonError("");
+    setPendingSuspensionSave(false);
   };
 
-  const guardarEdicionTrabajo = async () => {
+  const ejecutarGuardadoEdicion = async (motivoSuspension?: string) => {
     try {
       if (!trabajoSeleccionado || !editForm) return;
 
@@ -785,7 +795,7 @@ export default function Page() {
             fechaOrigen: trabajoSeleccionado.fecha,
             fechaDestino: editForm.fecha,
             motivo:
-              editForm.observacion.trim() ||
+              (motivoSuspension || "").trim() ||
               "Cambio de estado a Suspendido desde el calendario",
             timestamp: formatTimestamp(new Date()),
           },
@@ -795,12 +805,50 @@ export default function Page() {
 
       mostrarToast("Cambios guardados en OPAT");
       setSelectedId("");
+      setSuspensionReasonOpen(false);
+      setSuspensionReason("");
+      setSuspensionReasonError("");
+      setPendingSuspensionSave(false);
     } catch (err) {
       console.error(err);
       setEditError("No se pudo guardar la edición en OPAT.");
     } finally {
       setUpdatingDetail(false);
     }
+  };
+
+  const confirmarSuspensionConMotivo = async () => {
+    const motivo = suspensionReason.trim();
+
+    if (!motivo) {
+      setSuspensionReasonError("Debes ingresar el motivo de suspensión.");
+      return;
+    }
+
+    await ejecutarGuardadoEdicion(motivo);
+  };
+
+  const updateEditField = (field: keyof EditPTForm, value: string) => {
+    setEditForm((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
+  const guardarEdicionTrabajo = async () => {
+    if (!trabajoSeleccionado || !editForm) return;
+
+    setEditError("");
+
+    const oldEstado = trabajoSeleccionado.estado;
+    const newEstado = editForm.estado;
+
+    if (oldEstado !== "Suspendido" && newEstado === "Suspendido") {
+      setSuspensionReason("");
+      setSuspensionReasonError("");
+      setPendingSuspensionSave(true);
+      setSuspensionReasonOpen(true);
+      return;
+    }
+
+    await ejecutarGuardadoEdicion();
   };
 
   return (
@@ -1135,7 +1183,7 @@ export default function Page() {
       )}
 
       {trabajoSeleccionado && editForm && (
-        <div style={styles.modalOverlay} onClick={cerrarModal}>
+        <div style={styles.modalOverlay}>
           <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
@@ -1299,7 +1347,7 @@ export default function Page() {
       )}
 
       {newPTOpen && (
-        <div style={styles.modalOverlay} onClick={cerrarNuevoPT}>
+        <div style={styles.modalOverlay}>
           <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
@@ -1460,7 +1508,7 @@ export default function Page() {
       )}
 
       {moveReasonOpen && pendingMove && (
-        <div style={styles.modalOverlay} onClick={cerrarMoveReasonModal}>
+        <div style={styles.modalOverlay}>
           <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
@@ -1478,7 +1526,9 @@ export default function Page() {
               </button>
             </div>
 
-            {moveReasonError && <div style={styles.errorBox}>{moveReasonError}</div>}
+            {moveReasonError && (
+              <div style={styles.errorBox}>{moveReasonError}</div>
+            )}
 
             <FormField label="Motivo del cambio">
               <textarea
@@ -1507,6 +1557,62 @@ export default function Page() {
                 }}
               >
                 {moving ? "Guardando..." : "Confirmar cambio"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {suspensionReasonOpen && pendingSuspensionSave && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Motivo de suspensión</h2>
+                <div style={styles.modalSubtitle}>
+                  Ingresa el motivo para dejar registro en el historial
+                </div>
+              </div>
+
+              <button
+                onClick={cerrarSuspensionReasonModal}
+                style={styles.closeButton}
+              >
+                ✕
+              </button>
+            </div>
+
+            {suspensionReasonError && (
+              <div style={styles.errorBox}>{suspensionReasonError}</div>
+            )}
+
+            <FormField label="Motivo de suspensión">
+              <textarea
+                value={suspensionReason}
+                onChange={(e) => setSuspensionReason(e.target.value)}
+                style={styles.textarea}
+                placeholder="Ej: falta coordinación, condiciones de seguridad, recursos no disponibles, etc."
+              />
+            </FormField>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={cerrarSuspensionReasonModal}
+                style={styles.secondaryButton}
+              >
+                Cancelar
+              </button>
+
+              <button
+                onClick={confirmarSuspensionConMotivo}
+                disabled={updatingDetail}
+                style={{
+                  ...styles.primaryButton,
+                  opacity: updatingDetail ? 0.7 : 1,
+                  cursor: updatingDetail ? "not-allowed" : "pointer",
+                }}
+              >
+                {updatingDetail ? "Guardando..." : "Confirmar suspensión"}
               </button>
             </div>
           </div>
