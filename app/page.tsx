@@ -68,7 +68,8 @@ type NewPTForm = {
   estado: string;
   tipo: string;
   programador: string;
-  area: string;
+  aviso: string;
+  sodi: string;
 };
 
 type EditPTForm = {
@@ -100,6 +101,118 @@ type ToastState = {
   visible: boolean;
   message: string;
 };
+
+type CenAlertItem = {
+  id: string;
+  pt: string;
+  fecha: string;
+  subestacion: string;
+  componente: string;
+  actividad: string;
+  aviso: string;
+  motivo: "4_dias_habiles" | "12_dias_corridos";
+};
+
+const CHILE_HOLIDAYS_2026 = [
+  "2026-01-01",
+  "2026-04-03",
+  "2026-04-04",
+  "2026-05-01",
+  "2026-05-21",
+  "2026-06-21",
+  "2026-06-29",
+  "2026-07-16",
+  "2026-08-15",
+  "2026-09-18",
+  "2026-09-19",
+  "2026-10-12",
+  "2026-10-31",
+  "2026-11-01",
+  "2026-12-08",
+  "2026-12-25",
+];
+
+const ESSENTIAL_BARRAS = [
+  "BA S/E KAPATUR 220KV BP1",
+  "BA S/E KAPATUR 220KV BP2",
+  "BA S/E BUIN (ENEL TRANSMISION) 110KV BP1",
+  "BA S/E CHENA 110KV BP1",
+  "BA S/E EL SALTO 110KV BP1-1",
+  "BA S/E EL SALTO 110KV BP1-2",
+  "BA S/E FLORIDA 110KV BP1",
+  "BA S/E LOS ALMENDROS 110KV BP1",
+  "BA S/E OCHAGAVIA 110KV BP1",
+  "BA S/E OCHAGAVIA 110KV BP2",
+  "BA S/E EL SALTO 110KV BP2-1",
+  "BA S/E EL SALTO 110KV BP2-2",
+  "BA S/E ANTILLANCA 110KV BP1",
+  "BA S/E VALDIVIA (STS) 66KV BP1-S1",
+  "BA S/E PILAUCO 66KV BP1",
+  "BA S/E CHILOE 110KV BP1",
+  "BA S/E CHENA 110KV BP2",
+  "BA S/E CERRO NAVIA (STM II) 110KV B1",
+  "BA S/E CERRO NAVIA (STM II) 110KV B2",
+  "BA S/E EL SALTO 220KV BP1",
+  "BA S/E LOS ALMENDROS 220KV BP2",
+  "BA S/E ANTILLANCA 220KV BP1",
+  "BA S/E PILAUCO 220KV BA1",
+  "BA S/E CHENA 220KV BP1",
+  "BA S/E CHENA 220KV BP2 (AIS)",
+  "BA S/E MONTENEGRO 154KV BP1",
+  "BA S/E PARGUA 220KV BP1",
+  "BA S/E PARGUA 220KV BP2",
+  "BA S/E CHILOE 220KV BP1",
+  "BA S/E CHILOE 220KV BP2",
+  "BA S/E PUERTO MONTT (STS) 220KV BP3",
+  "BA S/E NUEVA LAMPA 220KV BP1",
+  "BA S/E NUEVA LAMPA 220KV BP2",
+];
+
+const ESSENTIAL_LLTT = [
+  "PUERTO MONTT - MELIPULLI 220KV",
+  "ALTO JAHUEL - BUIN (STM) 220KV",
+  "SAN BERNARDO - MALLOCO 110KV",
+  "ALTO JAHUEL - FLORIDA 110KV",
+  "ALTO JAHUEL - LOS ALMENDROS 220KV",
+  "CERRO NAVIA (STM) - CHENA 110KV",
+  "LOS ALMENDROS - EL SALTO 110KV",
+  "FLORIDA - LOS ALMENDROS 110KV",
+  "TAP LO ESPEJO - BUIN (STM) 110KV",
+  "LO ESPEJO - OCHAGAVIA 110KV",
+  "OCHAGAVIA - FLORIDA 110KV",
+  "POLPAICO (TRANSELEC) - EL SALTO 220KV",
+  "EL SALTO - CERRO NAVIA (STM) 110KV",
+  "RAHUE - PILAUCO 220KV",
+  "ANTILLANCA - RAHUE 220KV",
+  "KAPATUR - O'HIGGINS 220KV",
+  "MELIPULLI - PARGUA 220KV",
+  "LLANQUIHUE - TAP LLANQUIHUE 220KV",
+  "PARGUA - NUEVA ANCUD 220KV",
+  "NUEVA ANCUD - CHILOE 220KV",
+];
+
+const ESSENTIAL_TRANSFORMERS = [
+  "ANTILLANCA 220/110/23KV 180MVA ATR T1 + UR",
+  "ATR N°1 220/110/13.8KV 400MVA",
+  "CERRO NAVIA ATR N°2 220/110/13.2KV 400MVA",
+  "CHENA 220/110/13.8KV 400MVA 1",
+  "CHENA 220/110/13.8KV 400MVA 2",
+  "CHILOE 220/110/23KV 90MVA ATR T1 + UR",
+  "DEGAÑ 115/24KV 40MVA N°1",
+  "EL SALTO 220/110/34.5KV 400MVA 1 + URC",
+  "EL SALTO 220/110/34.5KV 400MVA 2 + URC",
+  "LLANQUIHUE 230/69/24KV 90MVA T1",
+  "LOS ALMENDROS 220/110KV 400MVA 1 + UR",
+  "MELIPULLI 230/115/69KV 60MVA 11",
+  "MELIPULLI 230/115/69KV 60MVA 22",
+  "MONTENEGRO 230-254/69/13.8KV 75MVA T1",
+  "NUEVA PICHIRROPULLI 230/69/24KV 90MVA N°1",
+  "NUEVA PICHIRROPULLI 230/69/24KV 90MVA N°2",
+  "PARGUA 230/115-69 KV 60MVA 1",
+  "PILAUCO 220/66/23kV 120MVA ATR T1 + UR",
+  "VALDIVIA 230/69/13,8KV 60MVA T1",
+  "VALDIVIA 230/69/13,8KV 60MVA T4",
+];
 
 function truncate(text: string, max = 90) {
   if (!text) return "-";
@@ -230,7 +343,8 @@ function emptyNewPTForm(fecha = ""): NewPTForm {
     estado: "En programación",
     tipo: "DESCONEXIÓN",
     programador: "",
-    area: "",
+    aviso: "",
+    sodi: "",
   };
 }
 
@@ -249,6 +363,146 @@ function buildEditForm(trabajo: TrabajoUI): EditPTForm {
     aviso: trabajo.aviso || "",
     sodi: trabajo.sodi || "",
   };
+}
+
+function isNumericAvisoReal(value: string) {
+  const v = (value || "").trim();
+  return /^\d{8,}$/.test(v);
+}
+
+function requiresCenReview(trabajo: TrabajoUI) {
+  if (normalizeText(trabajo.estado) === "suspendido") return false;
+
+  const aviso = normalizeText(trabajo.aviso);
+
+  if (!aviso) return true;
+  if (aviso === "pendiente") return true;
+  if (aviso === "no requiere") return false;
+  if (isNumericAvisoReal(trabajo.aviso)) return false;
+
+  return true;
+}
+
+function isHoliday(date: Date) {
+  return CHILE_HOLIDAYS_2026.includes(toLocalDateInputValue(date));
+}
+
+function isBusinessDay(date: Date) {
+  const day = date.getDay();
+  const isWeekend = day === 0 || day === 6;
+  return !isWeekend && !isHoliday(date);
+}
+
+function addDays(date: Date, days: number) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function subtractBusinessDays(date: Date, businessDays: number) {
+  let d = new Date(date);
+  let remaining = businessDays;
+
+  while (remaining > 0) {
+    d = addDays(d, -1);
+    if (isBusinessDay(d)) {
+      remaining -= 1;
+    }
+  }
+
+  return d;
+}
+
+function subtractCalendarDays(date: Date, days: number) {
+  return addDays(date, -days);
+}
+
+function startOfDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function getEffectiveOperationalDate(now: Date) {
+  const base = startOfDay(now);
+  if (now.getHours() < 7) {
+    return addDays(base, -1);
+  }
+  return base;
+}
+
+function sameDate(a: Date, b: Date) {
+  return toLocalDateInputValue(a) === toLocalDateInputValue(b);
+}
+
+function normalizeForEssentialMatch(value: string) {
+  return normalizeText(value)
+    .replace(/s\/e/g, "se")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildEssentialNeedles() {
+  const all = [...ESSENTIAL_BARRAS, ...ESSENTIAL_LLTT, ...ESSENTIAL_TRANSFORMERS];
+  return all.map((item) => normalizeForEssentialMatch(item));
+}
+
+const ESSENTIAL_NEEDLES = buildEssentialNeedles();
+
+function isEssentialInstallation(trabajo: TrabajoUI) {
+  const haystack = normalizeForEssentialMatch(
+    [
+      trabajo.subestacion,
+      trabajo.componente,
+      trabajo.actividad,
+      trabajo.tipo,
+    ].join(" ")
+  );
+
+  return ESSENTIAL_NEEDLES.some((needle) => haystack.includes(needle));
+}
+
+function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
+  const effectiveToday = getEffectiveOperationalDate(now);
+
+  const normal: CenAlertItem[] = [];
+  const essential: CenAlertItem[] = [];
+
+  for (const trabajo of trabajos) {
+    if (!trabajo.fecha) continue;
+    if (!requiresCenReview(trabajo)) continue;
+
+    const workDate = parseISODateLocal(trabajo.fecha);
+
+    const lastDay4Business = subtractBusinessDays(workDate, 5);
+    const lastDay12Calendar = subtractCalendarDays(workDate, 13);
+
+    if (sameDate(lastDay4Business, effectiveToday)) {
+      normal.push({
+        id: `normal-${trabajo.id}`,
+        pt: trabajo.pt,
+        fecha: trabajo.fecha,
+        subestacion: trabajo.subestacion,
+        componente: trabajo.componente,
+        actividad: trabajo.actividad,
+        aviso: trabajo.aviso,
+        motivo: "4_dias_habiles",
+      });
+    }
+
+    if (isEssentialInstallation(trabajo) && sameDate(lastDay12Calendar, effectiveToday)) {
+      essential.push({
+        id: `essential-${trabajo.id}`,
+        pt: trabajo.pt,
+        fecha: trabajo.fecha,
+        subestacion: trabajo.subestacion,
+        componente: trabajo.componente,
+        actividad: trabajo.actividad,
+        aviso: trabajo.aviso,
+        motivo: "12_dias_corridos",
+      });
+    }
+  }
+
+  return { normal, essential, effectiveToday };
 }
 
 export default function Page() {
@@ -294,16 +548,16 @@ export default function Page() {
   const [suspensionReasonError, setSuspensionReasonError] = useState("");
   const [pendingSuspensionSave, setPendingSuspensionSave] = useState(false);
 
+  const now = new Date();
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
   );
-
-  useEffect(() => {
+    useEffect(() => {
     if (!toast.visible) return;
     const timer = setTimeout(() => {
       setToast({ visible: false, message: "" });
-    }, 2200);
+    }, 2400);
     return () => clearTimeout(timer);
   }, [toast]);
 
@@ -366,6 +620,10 @@ export default function Page() {
       }))
       .sort(compareDateTime);
   }, [data]);
+
+  const cenAlerts = useMemo(() => {
+    return getCenAlertItems(trabajos, now);
+  }, [trabajos, now]);
 
   const trabajosFiltrados = useMemo(() => {
     const q = normalizeText(busqueda);
@@ -480,7 +738,7 @@ export default function Page() {
 
       const payload = {
         pt: newPTForm.pt.trim(),
-        area: newPTForm.area.trim(),
+        area: "",
         tipo: newPTForm.tipo,
         inicio: newPTForm.horaInicio,
         fin: newPTForm.horaFin,
@@ -490,8 +748,8 @@ export default function Page() {
         obs: newPTForm.observacion.trim(),
         re: "No",
         prog: newPTForm.programador.trim(),
-        aviso: "",
-        sodi: "",
+        aviso: newPTForm.aviso.trim(),
+        sodi: newPTForm.sodi.trim(),
         estado: newPTForm.estado,
         fInicio: newPTForm.fecha,
         fFin: newPTForm.fecha,
@@ -889,6 +1147,88 @@ export default function Page() {
         </div>
       </div>
 
+      {trabajos.length > 0 && (
+        <div style={styles.alertsWrap}>
+          <div style={styles.alertBox}>
+            <div style={styles.alertHeader}>
+              <div>
+                <div style={styles.alertTitle}>Avisos CEN por 4 días hábiles</div>
+                <div style={styles.alertSubtitle}>
+                  Último día operativo: {toLocalDateInputValue(cenAlerts.effectiveToday)}
+                </div>
+              </div>
+              <div style={styles.alertCount}>
+                {cenAlerts.normal.length}
+              </div>
+            </div>
+
+            {cenAlerts.normal.length === 0 ? (
+              <div style={styles.alertEmpty}>
+                Hoy no hay trabajos que venzan por la regla de 4 días hábiles.
+              </div>
+            ) : (
+              <div style={styles.alertList}>
+                {cenAlerts.normal.slice(0, 6).map((item) => (
+                  <div key={item.id} style={styles.alertItem}>
+                    <div style={styles.alertItemPt}>{item.pt}</div>
+                    <div style={styles.alertItemMeta}>
+                      {item.fecha} · {item.subestacion || "-"}
+                    </div>
+                    <div style={styles.alertItemDesc}>
+                      {truncate(item.componente || item.actividad || "-", 80)}
+                    </div>
+                  </div>
+                ))}
+                {cenAlerts.normal.length > 6 && (
+                  <div style={styles.alertMore}>
+                    +{cenAlerts.normal.length - 6} trabajo(s) más
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div style={styles.alertBoxEssential}>
+            <div style={styles.alertHeader}>
+              <div>
+                <div style={styles.alertTitle}>Avisos CEN instalaciones esenciales</div>
+                <div style={styles.alertSubtitle}>
+                  Regla de 12 días corridos · corte 07:00
+                </div>
+              </div>
+              <div style={styles.alertCountEssential}>
+                {cenAlerts.essential.length}
+              </div>
+            </div>
+
+            {cenAlerts.essential.length === 0 ? (
+              <div style={styles.alertEmpty}>
+                Hoy no hay trabajos esenciales que venzan por la regla de 12 días.
+              </div>
+            ) : (
+              <div style={styles.alertList}>
+                {cenAlerts.essential.slice(0, 6).map((item) => (
+                  <div key={item.id} style={styles.alertItem}>
+                    <div style={styles.alertItemPt}>{item.pt}</div>
+                    <div style={styles.alertItemMeta}>
+                      {item.fecha} · {item.subestacion || "-"}
+                    </div>
+                    <div style={styles.alertItemDesc}>
+                      {truncate(item.componente || item.actividad || "-", 80)}
+                    </div>
+                  </div>
+                ))}
+                {cenAlerts.essential.length > 6 && (
+                  <div style={styles.alertMore}>
+                    +{cenAlerts.essential.length - 6} trabajo(s) más
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div style={styles.filtersBox}>
         <div style={styles.filtersGridSimple}>
           <div style={styles.field}>
@@ -982,8 +1322,7 @@ export default function Page() {
             <div style={styles.weekHeader}>Vie</div>
             <div style={styles.weekHeader}>Sáb</div>
             <div style={styles.weekHeader}>Dom</div>
-
-            {diasMes.map((day) => {
+                        {diasMes.map((day) => {
               const items = trabajosPorFecha.get(day.iso) || [];
               const isToday = day.iso === toLocalDateInputValue(today);
               const isDropTarget = dropTargetDate === day.iso && draggingId;
@@ -1457,10 +1796,18 @@ export default function Page() {
                 />
               </FormField>
 
-              <FormField label="Área">
+              <FormField label="Aviso al CEN">
                 <input
-                  value={newPTForm.area}
-                  onChange={(e) => updateNewPTField("area", e.target.value)}
+                  value={newPTForm.aviso}
+                  onChange={(e) => updateNewPTField("aviso", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="SODI">
+                <input
+                  value={newPTForm.sodi}
+                  onChange={(e) => updateNewPTField("sodi", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -1624,21 +1971,6 @@ export default function Page() {
   );
 }
 
-function DetailItem({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div style={styles.detailItem}>
-      <div style={styles.detailItemLabel}>{label}</div>
-      <div style={styles.detailItemValue}>{value || "-"}</div>
-    </div>
-  );
-}
-
 function ReadOnlyField({
   label,
   value,
@@ -1735,6 +2067,102 @@ const styles: Record<string, React.CSSProperties> = {
   },
   summaryValue: {
     fontSize: 22,
+  },
+  alertsWrap: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))",
+    gap: 14,
+    marginBottom: 18,
+  },
+  alertBox: {
+    background: "#fff",
+    border: "1px solid #fde68a",
+    borderRadius: 14,
+    padding: 16,
+    boxShadow: "0 6px 18px rgba(15,23,42,0.04)",
+  },
+  alertBoxEssential: {
+    background: "#fff",
+    border: "1px solid #fecaca",
+    borderRadius: 14,
+    padding: 16,
+    boxShadow: "0 6px 18px rgba(15,23,42,0.04)",
+  },
+  alertHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "flex-start",
+    marginBottom: 12,
+  },
+  alertTitle: {
+    fontSize: 16,
+    fontWeight: 800,
+    marginBottom: 4,
+  },
+  alertSubtitle: {
+    fontSize: 12,
+    color: "#64748b",
+  },
+  alertCount: {
+    minWidth: 42,
+    height: 42,
+    borderRadius: 999,
+    background: "#fef3c7",
+    color: "#92400e",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontWeight: 800,
+    fontSize: 18,
+  },
+  alertCountEssential: {
+    minWidth: 42,
+    height: 42,
+    borderRadius: 999,
+    background: "#fee2e2",
+    color: "#b91c1c",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontWeight: 800,
+    fontSize: 18,
+  },
+  alertList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  alertItem: {
+    border: "1px solid #e2e8f0",
+    borderRadius: 10,
+    padding: 10,
+    background: "#f8fafc",
+  },
+  alertItemPt: {
+    fontSize: 13,
+    fontWeight: 800,
+    marginBottom: 4,
+  },
+  alertItemMeta: {
+    fontSize: 12,
+    color: "#475569",
+    marginBottom: 4,
+  },
+  alertItemDesc: {
+    fontSize: 12,
+    color: "#0f172a",
+  },
+  alertMore: {
+    fontSize: 12,
+    color: "#475569",
+    fontWeight: 700,
+    paddingTop: 2,
+  },
+  alertEmpty: {
+    fontSize: 13,
+    color: "#64748b",
+    paddingTop: 6,
   },
   filtersBox: {
     background: "#fff",
@@ -2058,46 +2486,6 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "flex-end",
     gap: 10,
     flexWrap: "wrap",
-  },
-  detailGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-    gap: 12,
-  },
-  detailItem: {
-    border: "1px solid #e2e8f0",
-    borderRadius: 12,
-    padding: 12,
-    background: "#f8fafc",
-  },
-  detailItemLabel: {
-    fontSize: 12,
-    color: "#64748b",
-    marginBottom: 6,
-    fontWeight: 700,
-  },
-  detailItemValue: {
-    fontSize: 14,
-    color: "#0f172a",
-    wordBreak: "break-word",
-  },
-  detailBlock: {
-    border: "1px solid #e2e8f0",
-    borderRadius: 12,
-    padding: 14,
-    background: "#f8fafc",
-    marginTop: 12,
-  },
-  detailBlockLabel: {
-    fontSize: 12,
-    fontWeight: 700,
-    color: "#64748b",
-    marginBottom: 8,
-  },
-  detailBlockValue: {
-    fontSize: 14,
-    lineHeight: 1.5,
-    whiteSpace: "pre-wrap",
   },
   toast: {
     position: "fixed",
