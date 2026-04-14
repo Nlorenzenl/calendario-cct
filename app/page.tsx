@@ -49,7 +49,7 @@ function truncate(text: string, max = 90) {
   return text.slice(0, max).trim() + "...";
 }
 
-function truncateSoft(text: string, max = 34) {
+function truncateSoft(text: string, max = 28) {
   if (!text) return "-";
   if (text.length <= max) return text;
   return text.slice(0, max).trim() + "...";
@@ -160,10 +160,6 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
-
-  const [filtroFechaInicio, setFiltroFechaInicio] = useState("");
-  const [filtroFechaFin, setFiltroFechaFin] = useState("");
-  const [filtroEstado, setFiltroEstado] = useState("todos");
   const [busqueda, setBusqueda] = useState("");
   const [vista, setVista] = useState<"tabla" | "calendario">("calendario");
 
@@ -193,7 +189,6 @@ export default function Page() {
       }
 
       setData(json);
-      setSelectedId("");
 
       const fechasValidas = json
         .map((item: OpatTrabajo) => item.fInicio)
@@ -233,60 +228,32 @@ export default function Page() {
       .sort(compareDateTime);
   }, [data]);
 
-  const estadosDisponibles = useMemo(() => {
-    const únicos = Array.from(
-      new Set(trabajos.map((t) => t.estado).filter(Boolean))
-    ).sort((a, b) => a.localeCompare(b));
-    return únicos;
-  }, [trabajos]);
-
   const trabajosFiltrados = useMemo(() => {
     const q = normalizeText(busqueda);
 
     return trabajos.filter((t) => {
-      if (filtroFechaInicio && t.fecha && t.fecha < filtroFechaInicio) {
-        return false;
-      }
+      if (!q) return true;
 
-      if (filtroFechaFin && t.fecha && t.fecha > filtroFechaFin) {
-        return false;
-      }
+      const textoCompleto = normalizeText(
+        [
+          t.pt,
+          t.subestacion,
+          t.componente,
+          t.actividad,
+          t.estado,
+          t.tipo,
+          t.programador,
+        ].join(" ")
+      );
 
-      if (filtroEstado !== "todos" && t.estado !== filtroEstado) {
-        return false;
-      }
-
-      if (q) {
-        const textoCompleto = normalizeText(
-          [
-            t.pt,
-            t.subestacion,
-            t.componente,
-            t.actividad,
-            t.estado,
-            t.tipo,
-            t.programador,
-          ].join(" ")
-        );
-
-        if (!textoCompleto.includes(q)) {
-          return false;
-        }
-      }
-
-      return true;
+      return textoCompleto.includes(q);
     });
-  }, [trabajos, filtroFechaInicio, filtroFechaFin, filtroEstado, busqueda]);
+  }, [trabajos, busqueda]);
 
   const trabajoSeleccionado =
-    trabajosFiltrados.find((t) => t.id === selectedId) || null;
-
-  const limpiarFiltros = () => {
-    setFiltroFechaInicio("");
-    setFiltroFechaFin("");
-    setFiltroEstado("todos");
-    setBusqueda("");
-  };
+    trabajosFiltrados.find((t) => t.id === selectedId) ||
+    trabajos.find((t) => t.id === selectedId) ||
+    null;
 
   const trabajosPorFecha = useMemo(() => {
     const map = new Map<string, TrabajoUI[]>();
@@ -318,6 +285,14 @@ export default function Page() {
     ).padStart(2, "0")}`;
     return trabajosFiltrados.filter((t) => t.fecha.startsWith(ym));
   }, [trabajosFiltrados, monthCursor]);
+
+  const limpiarBusqueda = () => {
+    setBusqueda("");
+  };
+
+  const cerrarModal = () => {
+    setSelectedId("");
+  };
 
   return (
     <main style={styles.page}>
@@ -358,43 +333,7 @@ export default function Page() {
       </div>
 
       <div style={styles.filtersBox}>
-        <div style={styles.filtersGrid}>
-          <div style={styles.field}>
-            <label style={styles.label}>Fecha inicio</label>
-            <input
-              type="date"
-              value={filtroFechaInicio}
-              onChange={(e) => setFiltroFechaInicio(e.target.value)}
-              style={styles.input}
-            />
-          </div>
-
-          <div style={styles.field}>
-            <label style={styles.label}>Fecha fin</label>
-            <input
-              type="date"
-              value={filtroFechaFin}
-              onChange={(e) => setFiltroFechaFin(e.target.value)}
-              style={styles.input}
-            />
-          </div>
-
-          <div style={styles.field}>
-            <label style={styles.label}>Estado</label>
-            <select
-              value={filtroEstado}
-              onChange={(e) => setFiltroEstado(e.target.value)}
-              style={styles.input}
-            >
-              <option value="todos">Todos</option>
-              {estadosDisponibles.map((estado) => (
-                <option key={estado} value={estado}>
-                  {estado}
-                </option>
-              ))}
-            </select>
-          </div>
-
+        <div style={styles.filtersGridSimple}>
           <div style={styles.field}>
             <label style={styles.label}>Buscar</label>
             <input
@@ -429,8 +368,8 @@ export default function Page() {
             </button>
           </div>
 
-          <button onClick={limpiarFiltros} style={styles.secondaryButton}>
-            Limpiar filtros
+          <button onClick={limpiarBusqueda} style={styles.secondaryButton}>
+            Limpiar búsqueda
           </button>
         </div>
       </div>
@@ -515,18 +454,14 @@ export default function Page() {
                             color: colors.color,
                             border: `1px solid ${colors.border}`,
                           }}
-                          title={`${trabajo.pt} · ${trabajo.subestacion} · ${trabajo.componente}`}
+                          title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
                         >
-                          <div style={styles.eventCompactTime}>
-                            {trabajo.horaInicio || "--:--"}
+                          <div style={styles.eventCompactSub}>
+                            {truncateSoft(trabajo.subestacion || "-", 24)}
                           </div>
 
                           <div style={styles.eventCompactPt}>
                             {trabajo.pt || "Sin PT"}
-                          </div>
-
-                          <div style={styles.eventCompactSub}>
-                            {truncateSoft(trabajo.subestacion || "-", 24)}
                           </div>
 
                           <div style={styles.eventCompactComp}>
@@ -608,53 +543,57 @@ export default function Page() {
 
           {trabajosFiltrados.length === 0 && (
             <div style={styles.emptyInner}>
-              No hay trabajos que coincidan con los filtros.
+              No hay trabajos que coincidan con la búsqueda.
             </div>
           )}
         </div>
       )}
 
       {trabajoSeleccionado && (
-        <div style={styles.detailBox}>
-          <h2 style={styles.detailTitle}>Detalle del trabajo</h2>
-
-          <div style={styles.detailGrid}>
-            <DetailItem label="Fecha" value={trabajoSeleccionado.fecha} />
-            <DetailItem label="PT" value={trabajoSeleccionado.pt} />
-            <DetailItem
-              label="Hora inicio"
-              value={trabajoSeleccionado.horaInicio}
-            />
-            <DetailItem label="Hora fin" value={trabajoSeleccionado.horaFin} />
-            <DetailItem
-              label="Subestación"
-              value={trabajoSeleccionado.subestacion}
-            />
-            <DetailItem
-              label="Componente"
-              value={trabajoSeleccionado.componente}
-            />
-            <DetailItem label="Estado" value={trabajoSeleccionado.estado} />
-            <DetailItem label="Tipo" value={trabajoSeleccionado.tipo} />
-            <DetailItem
-              label="Programador"
-              value={trabajoSeleccionado.programador}
-            />
-            <DetailItem label="Área" value={trabajoSeleccionado.area} />
-          </div>
-
-          <div style={{ marginTop: 16 }}>
-            <div style={styles.detailBlock}>
-              <div style={styles.detailBlockLabel}>Actividad</div>
-              <div style={styles.detailBlockValue}>
-                {trabajoSeleccionado.actividad || "-"}
+        <div style={styles.modalOverlay} onClick={cerrarModal}>
+          <div
+            style={styles.modal}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Detalle del trabajo</h2>
+                <div style={styles.modalSubtitle}>
+                  {trabajoSeleccionado.subestacion || "-"} · {trabajoSeleccionado.pt || "-"}
+                </div>
               </div>
+
+              <button onClick={cerrarModal} style={styles.closeButton}>
+                ✕
+              </button>
             </div>
 
-            <div style={styles.detailBlock}>
-              <div style={styles.detailBlockLabel}>Observación</div>
-              <div style={styles.detailBlockValue}>
-                {trabajoSeleccionado.observacion || "-"}
+            <div style={styles.detailGrid}>
+              <DetailItem label="Fecha" value={trabajoSeleccionado.fecha} />
+              <DetailItem label="PT" value={trabajoSeleccionado.pt} />
+              <DetailItem label="Hora inicio" value={trabajoSeleccionado.horaInicio} />
+              <DetailItem label="Hora fin" value={trabajoSeleccionado.horaFin} />
+              <DetailItem label="Subestación" value={trabajoSeleccionado.subestacion} />
+              <DetailItem label="Componente" value={trabajoSeleccionado.componente} />
+              <DetailItem label="Estado" value={trabajoSeleccionado.estado} />
+              <DetailItem label="Tipo" value={trabajoSeleccionado.tipo} />
+              <DetailItem label="Programador" value={trabajoSeleccionado.programador} />
+              <DetailItem label="Área" value={trabajoSeleccionado.area} />
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div style={styles.detailBlock}>
+                <div style={styles.detailBlockLabel}>Actividad</div>
+                <div style={styles.detailBlockValue}>
+                  {trabajoSeleccionado.actividad || "-"}
+                </div>
+              </div>
+
+              <div style={styles.detailBlock}>
+                <div style={styles.detailBlockLabel}>Observación</div>
+                <div style={styles.detailBlockValue}>
+                  {trabajoSeleccionado.observacion || "-"}
+                </div>
               </div>
             </div>
           </div>
@@ -753,9 +692,9 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 16,
     marginBottom: 18,
   },
-  filtersGrid: {
+  filtersGridSimple: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gridTemplateColumns: "1fr",
     gap: 14,
   },
   field: {
@@ -896,20 +835,15 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: "column",
     gap: 2,
   },
-  eventCompactTime: {
+  eventCompactSub: {
     fontSize: 11,
-    fontWeight: 800,
-    lineHeight: 1.2,
-  },
-  eventCompactPt: {
-    fontSize: 12,
     fontWeight: 800,
     lineHeight: 1.25,
     wordBreak: "break-word",
   },
-  eventCompactSub: {
-    fontSize: 11,
-    fontWeight: 700,
+  eventCompactPt: {
+    fontSize: 12,
+    fontWeight: 800,
     lineHeight: 1.25,
     wordBreak: "break-word",
   },
@@ -970,16 +904,52 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     color: "#64748b",
   },
-  detailBox: {
-    marginTop: 18,
-    background: "#fff",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
-    padding: 18,
+  modalOverlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(15, 23, 42, 0.45)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 20,
+    zIndex: 1000,
   },
-  detailTitle: {
-    margin: "0 0 14px 0",
-    fontSize: 20,
+  modal: {
+    width: "min(980px, 100%)",
+    maxHeight: "90vh",
+    overflowY: "auto",
+    background: "#fff",
+    borderRadius: 18,
+    border: "1px solid #e2e8f0",
+    boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
+    padding: 20,
+  },
+  modalHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 12,
+    marginBottom: 16,
+  },
+  modalTitle: {
+    margin: 0,
+    fontSize: 22,
+    fontWeight: 800,
+  },
+  modalSubtitle: {
+    marginTop: 6,
+    color: "#475569",
+    fontSize: 14,
+  },
+  closeButton: {
+    border: "1px solid #cbd5e1",
+    background: "#fff",
+    borderRadius: 10,
+    width: 40,
+    height: 40,
+    cursor: "pointer",
+    fontSize: 18,
+    fontWeight: 700,
   },
   detailGrid: {
     display: "grid",
