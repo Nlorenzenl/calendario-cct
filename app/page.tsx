@@ -37,6 +37,12 @@ type TrabajoUI = {
   area: string;
 };
 
+type CalendarDay = {
+  date: Date;
+  iso: string;
+  inMonth: boolean;
+};
+
 function truncate(text: string, max = 90) {
   if (!text) return "-";
   if (text.length <= max) return text;
@@ -57,6 +63,92 @@ function compareDateTime(a: TrabajoUI, b: TrabajoUI) {
   return aKey.localeCompare(bKey);
 }
 
+function toLocalDateInputValue(date: Date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function parseISODateLocal(iso: string) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+function formatMonthLabel(date: Date) {
+  return date.toLocaleDateString("es-CL", {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function buildMonthGrid(monthDate: Date): CalendarDay[] {
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+
+  const firstDay = new Date(year, month, 1);
+  const lastDay = new Date(year, month + 1, 0);
+
+  const startWeekDay = (firstDay.getDay() + 6) % 7;
+  const daysInMonth = lastDay.getDate();
+
+  const days: CalendarDay[] = [];
+
+  for (let i = startWeekDay; i > 0; i--) {
+    const d = new Date(year, month, 1 - i);
+    days.push({
+      date: d,
+      iso: toLocalDateInputValue(d),
+      inMonth: false,
+    });
+  }
+
+  for (let day = 1; day <= daysInMonth; day++) {
+    const d = new Date(year, month, day);
+    days.push({
+      date: d,
+      iso: toLocalDateInputValue(d),
+      inMonth: true,
+    });
+  }
+
+  while (days.length % 7 !== 0) {
+    const nextIndex = days.length - (startWeekDay + daysInMonth) + 1;
+    const d = new Date(year, month + 1, nextIndex);
+    days.push({
+      date: d,
+      iso: toLocalDateInputValue(d),
+      inMonth: false,
+    });
+  }
+
+  return days;
+}
+
+function estadoColor(estado: string) {
+  if (estado === "Autorizado") {
+    return {
+      background: "#e8fff1",
+      color: "#0f8a43",
+      border: "#b7ebc6",
+    };
+  }
+
+  if (estado === "Suspendido") {
+    return {
+      background: "#fff0f0",
+      color: "#b42318",
+      border: "#f5c2c7",
+    };
+  }
+
+  return {
+    background: "#eef2ff",
+    color: "#334155",
+    border: "#c7d2fe",
+  };
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -67,6 +159,12 @@ export default function Page() {
   const [filtroFechaFin, setFiltroFechaFin] = useState("");
   const [filtroEstado, setFiltroEstado] = useState("todos");
   const [busqueda, setBusqueda] = useState("");
+  const [vista, setVista] = useState<"tabla" | "calendario">("calendario");
+
+  const today = new Date();
+  const [monthCursor, setMonthCursor] = useState(
+    new Date(today.getFullYear(), today.getMonth(), 1)
+  );
 
   const cargarOPAT = async () => {
     try {
@@ -90,6 +188,16 @@ export default function Page() {
 
       setData(json);
       setSelectedId("");
+
+      const fechasValidas = json
+        .map((item: OpatTrabajo) => item.fInicio)
+        .filter(Boolean)
+        .sort();
+
+      if (fechasValidas.length > 0) {
+        const first = parseISODateLocal(fechasValidas[0] as string);
+        setMonthCursor(new Date(first.getFullYear(), first.getMonth(), 1));
+      }
     } catch (err) {
       console.error(err);
       setError("Ocurrió un error al cargar los datos desde OPAT");
@@ -174,13 +282,44 @@ export default function Page() {
     setBusqueda("");
   };
 
+  const trabajosPorFecha = useMemo(() => {
+    const map = new Map<string, TrabajoUI[]>();
+    for (const t of trabajosFiltrados) {
+      if (!t.fecha) continue;
+      if (!map.has(t.fecha)) {
+        map.set(t.fecha, []);
+      }
+      map.get(t.fecha)!.push(t);
+    }
+    return map;
+  }, [trabajosFiltrados]);
+
+  const diasMes = useMemo(() => buildMonthGrid(monthCursor), [monthCursor]);
+
+  const cambiarMes = (delta: number) => {
+    setMonthCursor(
+      new Date(monthCursor.getFullYear(), monthCursor.getMonth() + delta, 1)
+    );
+  };
+
+  const irHoy = () => {
+    setMonthCursor(new Date(today.getFullYear(), today.getMonth(), 1));
+  };
+
+  const trabajosMesActual = useMemo(() => {
+    const ym = `${monthCursor.getFullYear()}-${String(
+      monthCursor.getMonth() + 1
+    ).padStart(2, "0")}`;
+    return trabajosFiltrados.filter((t) => t.fecha.startsWith(ym));
+  }, [trabajosFiltrados, monthCursor]);
+
   return (
     <main style={styles.page}>
       <div style={styles.header}>
         <div>
           <h1 style={styles.title}>Calendario CCT · Agenda OPAT</h1>
           <p style={styles.subtitle}>
-            Vista inicial de trabajos traídos desde OPAT
+            Vista mensual operativa basada en trabajos traídos desde OPAT
           </p>
         </div>
 
@@ -205,6 +344,10 @@ export default function Page() {
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>Mostrados</span>
           <strong style={styles.summaryValue}>{trabajosFiltrados.length}</strong>
+        </div>
+        <div style={styles.summaryCard}>
+          <span style={styles.summaryLabel}>En mes visible</span>
+          <strong style={styles.summaryValue}>{trabajosMesActual.length}</strong>
         </div>
       </div>
 
@@ -259,6 +402,27 @@ export default function Page() {
         </div>
 
         <div style={styles.actionsRow}>
+          <div style={styles.segmented}>
+            <button
+              onClick={() => setVista("calendario")}
+              style={{
+                ...styles.segmentButton,
+                ...(vista === "calendario" ? styles.segmentButtonActive : {}),
+              }}
+            >
+              Calendario
+            </button>
+            <button
+              onClick={() => setVista("tabla")}
+              style={{
+                ...styles.segmentButton,
+                ...(vista === "tabla" ? styles.segmentButtonActive : {}),
+              }}
+            >
+              Tabla
+            </button>
+          </div>
+
           <button onClick={limpiarFiltros} style={styles.secondaryButton}>
             Limpiar filtros
           </button>
@@ -273,7 +437,105 @@ export default function Page() {
         </div>
       )}
 
-      {trabajos.length > 0 && (
+      {trabajos.length > 0 && vista === "calendario" && (
+        <>
+          <div style={styles.calendarToolbar}>
+            <div style={styles.calendarNav}>
+              <button onClick={() => cambiarMes(-1)} style={styles.secondaryButton}>
+                ← Mes anterior
+              </button>
+              <button onClick={irHoy} style={styles.secondaryButton}>
+                Mes actual
+              </button>
+              <button onClick={() => cambiarMes(1)} style={styles.secondaryButton}>
+                Mes siguiente →
+              </button>
+            </div>
+
+            <div style={styles.calendarTitle}>
+              {formatMonthLabel(monthCursor)}
+            </div>
+          </div>
+
+          <div style={styles.calendarWrap}>
+            <div style={styles.weekHeader}>Lun</div>
+            <div style={styles.weekHeader}>Mar</div>
+            <div style={styles.weekHeader}>Mié</div>
+            <div style={styles.weekHeader}>Jue</div>
+            <div style={styles.weekHeader}>Vie</div>
+            <div style={styles.weekHeader}>Sáb</div>
+            <div style={styles.weekHeader}>Dom</div>
+
+            {diasMes.map((day) => {
+              const items = trabajosPorFecha.get(day.iso) || [];
+              const isToday = day.iso === toLocalDateInputValue(today);
+
+              return (
+                <div
+                  key={day.iso}
+                  style={{
+                    ...styles.dayCell,
+                    background: day.inMonth ? "#fff" : "#f8fafc",
+                    opacity: day.inMonth ? 1 : 0.65,
+                    borderColor: isToday ? "#3b82f6" : "#e2e8f0",
+                  }}
+                >
+                  <div style={styles.dayHeader}>
+                    <span
+                      style={{
+                        ...styles.dayNumber,
+                        background: isToday ? "#dbeafe" : "transparent",
+                        color: isToday ? "#1d4ed8" : "#0f172a",
+                      }}
+                    >
+                      {day.date.getDate()}
+                    </span>
+                    {items.length > 0 && (
+                      <span style={styles.dayCount}>{items.length}</span>
+                    )}
+                  </div>
+
+                  <div style={styles.dayItems}>
+                    {items.slice(0, 4).map((trabajo) => {
+                      const colors = estadoColor(trabajo.estado);
+
+                      return (
+                        <button
+                          key={trabajo.id}
+                          onClick={() => setSelectedId(trabajo.id)}
+                          style={{
+                            ...styles.eventCard,
+                            background: colors.background,
+                            color: colors.color,
+                            border: `1px solid ${colors.border}`,
+                          }}
+                          title={`${trabajo.pt} · ${trabajo.subestacion} · ${trabajo.componente}`}
+                        >
+                          <div style={styles.eventTime}>
+                            {trabajo.horaInicio || "--:--"}
+                          </div>
+                          <div style={styles.eventPt}>{trabajo.pt || "Sin PT"}</div>
+                          <div style={styles.eventSub}>
+                            {trabajo.subestacion || trabajo.componente || "-"}
+                          </div>
+                        </button>
+                      );
+                    })}
+
+                    {items.length > 4 && (
+                      <div style={styles.moreItems}>
+                        +{items.length - 4} trabajo(s) más
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {trabajos.length > 0 && vista === "tabla" && (
         <div style={styles.tableWrap}>
           <table style={styles.table}>
             <thead>
@@ -317,18 +579,8 @@ export default function Page() {
                       <span
                         style={{
                           ...styles.estadoChip,
-                          background:
-                            trabajo.estado === "Autorizado"
-                              ? "#e8fff1"
-                              : trabajo.estado === "Suspendido"
-                              ? "#fff0f0"
-                              : "#eef2ff",
-                          color:
-                            trabajo.estado === "Autorizado"
-                              ? "#0f8a43"
-                              : trabajo.estado === "Suspendido"
-                              ? "#b42318"
-                              : "#334155",
+                          background: estadoColor(trabajo.estado).background,
+                          color: estadoColor(trabajo.estado).color,
                         }}
                       >
                         {trabajo.estado || "-"}
@@ -513,8 +765,30 @@ const styles: Record<string, React.CSSProperties> = {
   },
   actionsRow: {
     display: "flex",
-    justifyContent: "flex-end",
+    justifyContent: "space-between",
+    gap: 12,
     marginTop: 14,
+    flexWrap: "wrap",
+    alignItems: "center",
+  },
+  segmented: {
+    display: "inline-flex",
+    border: "1px solid #cbd5e1",
+    borderRadius: 10,
+    overflow: "hidden",
+    background: "#fff",
+  },
+  segmentButton: {
+    padding: "10px 14px",
+    border: "none",
+    background: "#fff",
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  segmentButtonActive: {
+    background: "#2563eb",
+    color: "#fff",
   },
   errorBox: {
     marginBottom: 16,
@@ -529,6 +803,101 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #e2e8f0",
     borderRadius: 12,
     padding: 20,
+  },
+  calendarToolbar: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 12,
+    flexWrap: "wrap",
+    marginBottom: 14,
+  },
+  calendarNav: {
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  calendarTitle: {
+    fontSize: 24,
+    fontWeight: 800,
+    textTransform: "capitalize",
+  },
+  calendarWrap: {
+    display: "grid",
+    gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
+    border: "1px solid #e2e8f0",
+    borderRadius: 14,
+    overflow: "hidden",
+    background: "#fff",
+  },
+  weekHeader: {
+    padding: "12px 10px",
+    background: "#f1f5f9",
+    borderBottom: "1px solid #e2e8f0",
+    fontSize: 13,
+    fontWeight: 800,
+    textAlign: "center",
+  },
+  dayCell: {
+    minHeight: 170,
+    borderRight: "1px solid #e2e8f0",
+    borderBottom: "1px solid #e2e8f0",
+    padding: 8,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  dayHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  dayNumber: {
+    fontSize: 14,
+    fontWeight: 800,
+    borderRadius: 999,
+    padding: "4px 8px",
+  },
+  dayCount: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#475569",
+    background: "#e2e8f0",
+    borderRadius: 999,
+    padding: "2px 8px",
+  },
+  dayItems: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  eventCard: {
+    width: "100%",
+    textAlign: "left",
+    borderRadius: 10,
+    padding: 8,
+    cursor: "pointer",
+    fontSize: 12,
+  },
+  eventTime: {
+    fontWeight: 800,
+    marginBottom: 4,
+  },
+  eventPt: {
+    fontWeight: 700,
+    marginBottom: 2,
+    wordBreak: "break-word",
+  },
+  eventSub: {
+    fontSize: 11,
+    lineHeight: 1.3,
+    wordBreak: "break-word",
+  },
+  moreItems: {
+    fontSize: 12,
+    color: "#64748b",
+    padding: "2px 4px",
+    fontWeight: 700,
   },
   tableWrap: {
     background: "#fff",
