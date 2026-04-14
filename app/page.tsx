@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type OpatTrabajo = {
   pt: string;
@@ -200,10 +200,32 @@ export default function Page() {
   const [newPTForm, setNewPTForm] = useState<NewPTForm>(emptyNewPTForm());
   const [newPTError, setNewPTError] = useState("");
 
+  const [toast, setToast] = useState<{
+    visible: boolean;
+    message: string;
+  }>({
+    visible: false,
+    message: "",
+  });
+
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
   );
+
+  useEffect(() => {
+    if (!toast.visible) return;
+
+    const timer = setTimeout(() => {
+      setToast({ visible: false, message: "" });
+    }, 2200);
+
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  const mostrarToast = (message: string) => {
+    setToast({ visible: true, message });
+  };
 
   const cargarOPAT = async () => {
     try {
@@ -406,10 +428,32 @@ export default function Page() {
         throw new Error(json?.error || "No se pudo guardar el PT.");
       }
 
+      setData((prev) => [
+        {
+          pt: payload.pt,
+          area: payload.area,
+          tipo: payload.tipo,
+          inicio: payload.inicio,
+          fin: payload.fin,
+          ssee: payload.ssee,
+          comp: payload.comp,
+          desc: payload.desc,
+          obs: payload.obs,
+          re: payload.re,
+          prog: payload.prog,
+          aviso: payload.aviso,
+          sodi: payload.sodi,
+          estado: payload.estado,
+          fInicio: payload.fInicio,
+          fFin: payload.fFin,
+        },
+        ...prev,
+      ]);
+
       setNewPTOpen(false);
       setNewPTError("");
-
-      await cargarOPAT();
+      setNewPTForm(emptyNewPTForm());
+      mostrarToast("PT guardado en OPAT");
     } catch (err) {
       console.error(err);
       setNewPTError("No se pudo guardar el PT en OPAT.");
@@ -881,6 +925,12 @@ export default function Page() {
           </div>
         </div>
       )}
+
+      {toast.visible && (
+        <div style={styles.toast}>
+          {toast.message}
+        </div>
+      )}
     </main>
   );
 }
@@ -1331,5 +1381,18 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     lineHeight: 1.5,
     whiteSpace: "pre-wrap",
+  },
+  toast: {
+    position: "fixed",
+    right: 20,
+    bottom: 20,
+    background: "#16a34a",
+    color: "#fff",
+    padding: "12px 16px",
+    borderRadius: 12,
+    fontSize: 14,
+    fontWeight: 700,
+    boxShadow: "0 10px 30px rgba(22, 163, 74, 0.35)",
+    zIndex: 1200,
   },
 };
