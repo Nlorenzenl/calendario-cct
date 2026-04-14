@@ -19,10 +19,21 @@ type OpatTrabajo = {
   estado?: string;
   fInicio?: string;
   fFin?: string;
+  to1?: string;
+  to2?: string;
+  go1?: string;
+  go2?: string;
+  gop?: string;
+  esSodi?: string;
+  sodiCorrelativo?: string;
+  sodiPara?: string;
+  sodiDe?: string;
+  gm?: string;
 };
 
 type TrabajoUI = {
   id: string;
+  original: OpatTrabajo;
   fecha: string;
   pt: string;
   horaInicio: string;
@@ -56,6 +67,20 @@ type NewPTForm = {
   tipo: string;
   programador: string;
   area: string;
+};
+
+type HistoryItem = {
+  id: string;
+  pt: string;
+  fechaOrigen: string;
+  fechaDestino: string;
+  motivo: string;
+  timestamp: string;
+};
+
+type ToastState = {
+  visible: boolean;
+  message: string;
 };
 
 function truncate(text: string, max = 90) {
@@ -101,6 +126,10 @@ function formatMonthLabel(date: Date) {
     month: "long",
     year: "numeric",
   });
+}
+
+function formatTimestamp(date: Date) {
+  return date.toLocaleString("es-CL");
 }
 
 function buildMonthGrid(monthDate: Date): CalendarDay[] {
@@ -191,22 +220,33 @@ export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [moving, setMoving] = useState(false);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
   const [busqueda, setBusqueda] = useState("");
-  const [vista, setVista] = useState<"tabla" | "calendario">("calendario");
+  const [vista, setVista] = useState<"calendario" | "tabla" | "historial">("calendario");
 
   const [newPTOpen, setNewPTOpen] = useState(false);
   const [newPTForm, setNewPTForm] = useState<NewPTForm>(emptyNewPTForm());
   const [newPTError, setNewPTError] = useState("");
 
-  const [toast, setToast] = useState<{
-    visible: boolean;
-    message: string;
-  }>({
+  const [toast, setToast] = useState<ToastState>({
     visible: false,
     message: "",
   });
+
+  const [historial, setHistorial] = useState<HistoryItem[]>([]);
+
+  const [draggingId, setDraggingId] = useState<string>("");
+  const [dropTargetDate, setDropTargetDate] = useState<string>("");
+  const [moveReasonOpen, setMoveReasonOpen] = useState(false);
+  const [moveReason, setMoveReason] = useState("");
+  const [moveReasonError, setMoveReasonError] = useState("");
+  const [pendingMove, setPendingMove] = useState<{
+    trabajoId: string;
+    fromDate: string;
+    toDate: string;
+  } | null>(null);
 
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
@@ -215,11 +255,9 @@ export default function Page() {
 
   useEffect(() => {
     if (!toast.visible) return;
-
     const timer = setTimeout(() => {
       setToast({ visible: false, message: "" });
     }, 2200);
-
     return () => clearTimeout(timer);
   }, [toast]);
 
@@ -271,6 +309,7 @@ export default function Page() {
     return data
       .map((item, index) => ({
         id: `${item.pt || "sin-pt"}-${item.fInicio || "sin-fecha"}-${index}`,
+        original: item,
         fecha: item.fInicio || "",
         pt: item.pt || "",
         horaInicio: item.inicio || "",
@@ -446,6 +485,16 @@ export default function Page() {
           estado: payload.estado,
           fInicio: payload.fInicio,
           fFin: payload.fFin,
+          to1: payload.to1,
+          to2: payload.to2,
+          go1: payload.go1,
+          go2: payload.go2,
+          gop: payload.gop,
+          esSodi: payload.esSodi,
+          sodiCorrelativo: payload.sodiCorrelativo,
+          sodiPara: payload.sodiPara,
+          sodiDe: payload.sodiDe,
+          gm: payload.gm,
         },
         ...prev,
       ]);
@@ -459,6 +508,144 @@ export default function Page() {
       setNewPTError("No se pudo guardar el PT en OPAT.");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onDragStartTrabajo = (trabajoId: string) => {
+    setDraggingId(trabajoId);
+  };
+
+  const onDragEndTrabajo = () => {
+    setDraggingId("");
+    setDropTargetDate("");
+  };
+
+  const onDragOverDay = (dateIso: string, e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!draggingId) return;
+    setDropTargetDate(dateIso);
+  };
+
+  const onDropDay = (dateIso: string, e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+
+    if (!draggingId) return;
+
+    const trabajo = trabajos.find((t) => t.id === draggingId);
+    if (!trabajo) {
+      setDraggingId("");
+      setDropTargetDate("");
+      return;
+    }
+
+    if (trabajo.fecha === dateIso) {
+      setDraggingId("");
+      setDropTargetDate("");
+      return;
+    }
+
+    setPendingMove({
+      trabajoId: trabajo.id,
+      fromDate: trabajo.fecha,
+      toDate: dateIso,
+    });
+    setMoveReason("");
+    setMoveReasonError("");
+    setMoveReasonOpen(true);
+    setDraggingId("");
+    setDropTargetDate("");
+  };
+
+  const cerrarMoveReasonModal = () => {
+    if (moving) return;
+    setMoveReasonOpen(false);
+    setMoveReason("");
+    setMoveReasonError("");
+    setPendingMove(null);
+  };
+
+  const confirmarMovimiento = async () => {
+    try {
+      if (!pendingMove) return;
+
+      const motivo = moveReason.trim();
+      if (!motivo) {
+        setMoveReasonError("Debes ingresar el motivo del cambio.");
+        return;
+      }
+
+      const trabajo = trabajos.find((t) => t.id === pendingMove.trabajoId);
+      if (!trabajo) {
+        setMoveReasonError("No se encontró el trabajo a mover.");
+        return;
+      }
+
+      setMoving(true);
+      setMoveReasonError("");
+
+      const original = trabajo.original;
+
+      const updatedPayload: OpatTrabajo = {
+        ...original,
+        fInicio: pendingMove.toDate,
+        fFin: pendingMove.toDate,
+      };
+
+      const res = await fetch("/api/opat/update", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(updatedPayload),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.success) {
+        throw new Error(json?.error || "No se pudo reprogramar el PT.");
+      }
+
+      setData((prev) =>
+        prev.map((item) => {
+          const samePT = item.pt === original.pt;
+          const sameFecha = item.fInicio === original.fInicio;
+          const sameInicio = item.inicio === original.inicio;
+          const sameFin = item.fin === original.fin;
+
+          if (samePT && sameFecha && sameInicio && sameFin) {
+            return {
+              ...item,
+              fInicio: pendingMove.toDate,
+              fFin: pendingMove.toDate,
+            };
+          }
+
+          return item;
+        })
+      );
+
+      setHistorial((prev) => [
+        {
+          id: `${trabajo.pt}-${Date.now()}`,
+          pt: trabajo.pt,
+          fechaOrigen: pendingMove.fromDate,
+          fechaDestino: pendingMove.toDate,
+          motivo,
+          timestamp: formatTimestamp(new Date()),
+        },
+        ...prev,
+      ]);
+
+      setMoveReasonOpen(false);
+      setPendingMove(null);
+      setMoveReason("");
+      setMoveReasonError("");
+      mostrarToast("PT reprogramado en OPAT");
+    } catch (err) {
+      console.error(err);
+      setMoveReasonError("No se pudo reprogramar el PT en OPAT.");
+    } finally {
+      setMoving(false);
     }
   };
 
@@ -534,6 +721,15 @@ export default function Page() {
             >
               Tabla
             </button>
+            <button
+              onClick={() => setVista("historial")}
+              style={{
+                ...styles.segmentButton,
+                ...(vista === "historial" ? styles.segmentButtonActive : {}),
+              }}
+            >
+              Historial
+            </button>
           </div>
 
           <button onClick={limpiarBusqueda} style={styles.secondaryButton}>
@@ -582,15 +778,25 @@ export default function Page() {
             {diasMes.map((day) => {
               const items = trabajosPorFecha.get(day.iso) || [];
               const isToday = day.iso === toLocalDateInputValue(today);
+              const isDropTarget = dropTargetDate === day.iso && draggingId;
 
               return (
                 <div
                   key={day.iso}
+                  onDragOver={(e) => onDragOverDay(day.iso, e)}
+                  onDrop={(e) => onDropDay(day.iso, e)}
                   style={{
                     ...styles.dayCell,
                     background: day.inMonth ? "#fff" : "#f8fafc",
                     opacity: day.inMonth ? 1 : 0.65,
-                    borderColor: isToday ? "#3b82f6" : "#e2e8f0",
+                    borderColor: isDropTarget
+                      ? "#16a34a"
+                      : isToday
+                      ? "#3b82f6"
+                      : "#e2e8f0",
+                    boxShadow: isDropTarget
+                      ? "inset 0 0 0 2px rgba(22,163,74,0.18)"
+                      : "none",
                   }}
                 >
                   <div style={styles.dayHeader}>
@@ -623,12 +829,16 @@ export default function Page() {
                       return (
                         <button
                           key={trabajo.id}
+                          draggable
+                          onDragStart={() => onDragStartTrabajo(trabajo.id)}
+                          onDragEnd={onDragEndTrabajo}
                           onClick={() => setSelectedId(trabajo.id)}
                           style={{
                             ...styles.eventCardCompact,
                             background: colors.background,
                             color: colors.color,
                             border: `1px solid ${colors.border}`,
+                            opacity: draggingId === trabajo.id ? 0.55 : 1,
                           }}
                           title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
                         >
@@ -720,6 +930,39 @@ export default function Page() {
           {trabajosFiltrados.length === 0 && (
             <div style={styles.emptyInner}>
               No hay trabajos que coincidan con la búsqueda.
+            </div>
+          )}
+        </div>
+      )}
+
+      {vista === "historial" && (
+        <div style={styles.tableWrap}>
+          <table style={styles.table}>
+            <thead>
+              <tr style={styles.tableHeadRow}>
+                <th style={styles.th}>PT</th>
+                <th style={styles.th}>Fecha origen</th>
+                <th style={styles.th}>Fecha destino</th>
+                <th style={styles.th}>Motivo</th>
+                <th style={styles.th}>Fecha registro</th>
+              </tr>
+            </thead>
+            <tbody>
+              {historial.map((item) => (
+                <tr key={item.id} style={styles.tr}>
+                  <td style={styles.td}>{item.pt}</td>
+                  <td style={styles.td}>{item.fechaOrigen}</td>
+                  <td style={styles.td}>{item.fechaDestino}</td>
+                  <td style={styles.td}>{item.motivo}</td>
+                  <td style={styles.td}>{item.timestamp}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {historial.length === 0 && (
+            <div style={styles.emptyInner}>
+              Aún no hay cambios históricos registrados.
             </div>
           )}
         </div>
@@ -926,11 +1169,55 @@ export default function Page() {
         </div>
       )}
 
-      {toast.visible && (
-        <div style={styles.toast}>
-          {toast.message}
+      {moveReasonOpen && pendingMove && (
+        <div style={styles.modalOverlay} onClick={cerrarMoveReasonModal}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Reprogramar PT</h2>
+                <div style={styles.modalSubtitle}>
+                  {pendingMove.fromDate} → {pendingMove.toDate}
+                </div>
+              </div>
+
+              <button onClick={cerrarMoveReasonModal} style={styles.closeButton}>
+                ✕
+              </button>
+            </div>
+
+            {moveReasonError && <div style={styles.errorBox}>{moveReasonError}</div>}
+
+            <FormField label="Motivo del cambio">
+              <textarea
+                value={moveReason}
+                onChange={(e) => setMoveReason(e.target.value)}
+                style={styles.textarea}
+                placeholder="Ej: reprogramación por coordinación, disponibilidad, clima, etc."
+              />
+            </FormField>
+
+            <div style={styles.modalActions}>
+              <button onClick={cerrarMoveReasonModal} style={styles.secondaryButton}>
+                Cancelar
+              </button>
+
+              <button
+                onClick={confirmarMovimiento}
+                disabled={moving}
+                style={{
+                  ...styles.primaryButton,
+                  opacity: moving ? 0.7 : 1,
+                  cursor: moving ? "not-allowed" : "pointer",
+                }}
+              >
+                {moving ? "Guardando..." : "Confirmar cambio"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
+
+      {toast.visible && <div style={styles.toast}>{toast.message}</div>}
     </main>
   );
 }
@@ -1161,6 +1448,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     gap: 8,
+    transition: "box-shadow 0.12s ease, border-color 0.12s ease",
   },
   dayHeader: {
     display: "flex",
@@ -1198,7 +1486,7 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "left",
     borderRadius: 10,
     padding: "7px 8px",
-    cursor: "pointer",
+    cursor: "grab",
     fontSize: 12,
     display: "flex",
     flexDirection: "column",
@@ -1238,7 +1526,7 @@ const styles: Record<string, React.CSSProperties> = {
   table: {
     width: "100%",
     borderCollapse: "collapse",
-    minWidth: 1100,
+    minWidth: 900,
   },
   tableHeadRow: {
     background: "#f8fafc",
