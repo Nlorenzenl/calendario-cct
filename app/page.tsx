@@ -46,6 +46,8 @@ type TrabajoUI = {
   observacion: string;
   programador: string;
   area: string;
+  aviso: string;
+  sodi: string;
 };
 
 type CalendarDay = {
@@ -69,8 +71,24 @@ type NewPTForm = {
   area: string;
 };
 
+type EditPTForm = {
+  fecha: string;
+  horaInicio: string;
+  horaFin: string;
+  subestacion: string;
+  componente: string;
+  actividad: string;
+  observacion: string;
+  estado: string;
+  tipo: string;
+  programador: string;
+  aviso: string;
+  sodi: string;
+};
+
 type HistoryItem = {
   id: string;
+  tipo: "reprogramacion" | "suspension";
   pt: string;
   fechaOrigen: string;
   fechaDestino: string;
@@ -216,19 +234,42 @@ function emptyNewPTForm(fecha = ""): NewPTForm {
   };
 }
 
+function buildEditForm(trabajo: TrabajoUI): EditPTForm {
+  return {
+    fecha: trabajo.fecha,
+    horaInicio: trabajo.horaInicio || "08:00",
+    horaFin: trabajo.horaFin || "18:00",
+    subestacion: trabajo.subestacion || "",
+    componente: trabajo.componente || "",
+    actividad: trabajo.actividad || "",
+    observacion: trabajo.observacion || "",
+    estado: trabajo.estado || "En programación",
+    tipo: trabajo.tipo || "DESCONEXIÓN",
+    programador: trabajo.programador || "",
+    aviso: trabajo.aviso || "",
+    sodi: trabajo.sodi || "",
+  };
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [moving, setMoving] = useState(false);
+  const [updatingDetail, setUpdatingDetail] = useState(false);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
   const [busqueda, setBusqueda] = useState("");
-  const [vista, setVista] = useState<"calendario" | "tabla" | "historial">("calendario");
+  const [vista, setVista] = useState<"calendario" | "tabla" | "historial">(
+    "calendario"
+  );
 
   const [newPTOpen, setNewPTOpen] = useState(false);
   const [newPTForm, setNewPTForm] = useState<NewPTForm>(emptyNewPTForm());
   const [newPTError, setNewPTError] = useState("");
+
+  const [editForm, setEditForm] = useState<EditPTForm | null>(null);
+  const [editError, setEditError] = useState("");
 
   const [toast, setToast] = useState<ToastState>({
     visible: false,
@@ -287,15 +328,8 @@ export default function Page() {
 
       setData(json);
 
-      const fechasValidas = json
-        .map((item: OpatTrabajo) => item.fInicio)
-        .filter(Boolean)
-        .sort();
-
-      if (fechasValidas.length > 0) {
-        const first = parseISODateLocal(fechasValidas[0] as string);
-        setMonthCursor(new Date(first.getFullYear(), first.getMonth(), 1));
-      }
+      const actual = new Date();
+      setMonthCursor(new Date(actual.getFullYear(), actual.getMonth(), 1));
     } catch (err) {
       console.error(err);
       setError("Ocurrió un error al cargar los datos desde OPAT");
@@ -322,6 +356,8 @@ export default function Page() {
         observacion: item.obs || "",
         programador: item.prog || "",
         area: item.area || "",
+        aviso: item.aviso || "",
+        sodi: item.sodi || "",
       }))
       .sort(compareDateTime);
   }, [data]);
@@ -341,6 +377,8 @@ export default function Page() {
           t.estado,
           t.tipo,
           t.programador,
+          t.aviso,
+          t.sodi,
         ].join(" ")
       );
 
@@ -352,6 +390,16 @@ export default function Page() {
     trabajosFiltrados.find((t) => t.id === selectedId) ||
     trabajos.find((t) => t.id === selectedId) ||
     null;
+
+  useEffect(() => {
+    if (trabajoSeleccionado) {
+      setEditForm(buildEditForm(trabajoSeleccionado));
+      setEditError("");
+    } else {
+      setEditForm(null);
+      setEditError("");
+    }
+  }, [selectedId, trabajoSeleccionado?.id]);
 
   const trabajosPorFecha = useMemo(() => {
     const map = new Map<string, TrabajoUI[]>();
@@ -520,7 +568,10 @@ export default function Page() {
     setDropTargetDate("");
   };
 
-  const onDragOverDay = (dateIso: string, e: React.DragEvent<HTMLDivElement>) => {
+  const onDragOverDay = (
+    dateIso: string,
+    e: React.DragEvent<HTMLDivElement>
+  ) => {
     e.preventDefault();
     if (!draggingId) return;
     setDropTargetDate(dateIso);
@@ -627,6 +678,7 @@ export default function Page() {
       setHistorial((prev) => [
         {
           id: `${trabajo.pt}-${Date.now()}`,
+          tipo: "reprogramacion",
           pt: trabajo.pt,
           fechaOrigen: pendingMove.fromDate,
           fechaDestino: pendingMove.toDate,
@@ -646,6 +698,108 @@ export default function Page() {
       setMoveReasonError("No se pudo reprogramar el PT en OPAT.");
     } finally {
       setMoving(false);
+    }
+  };
+
+  const updateEditField = (field: keyof EditPTForm, value: string) => {
+    setEditForm((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
+  const guardarEdicionTrabajo = async () => {
+    try {
+      if (!trabajoSeleccionado || !editForm) return;
+
+      setUpdatingDetail(true);
+      setEditError("");
+
+      const original = trabajoSeleccionado.original;
+      const oldEstado = trabajoSeleccionado.estado;
+
+      const updatedPayload: OpatTrabajo = {
+        ...original,
+        tipo: editForm.tipo,
+        inicio: editForm.horaInicio,
+        fin: editForm.horaFin,
+        ssee: editForm.subestacion.trim(),
+        comp: editForm.componente.trim(),
+        desc: editForm.actividad.trim(),
+        obs: editForm.observacion.trim(),
+        prog: editForm.programador.trim(),
+        aviso: editForm.aviso.trim(),
+        sodi: editForm.sodi.trim(),
+        estado: editForm.estado,
+        fInicio: editForm.fecha,
+        fFin: editForm.fecha,
+      };
+
+      const res = await fetch("/api/opat/update", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(updatedPayload),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.success) {
+        throw new Error(json?.error || "No se pudo actualizar el trabajo.");
+      }
+
+      setData((prev) =>
+        prev.map((item) => {
+          const samePT = item.pt === original.pt;
+          const sameFecha = item.fInicio === original.fInicio;
+          const sameInicio = item.inicio === original.inicio;
+          const sameFin = item.fin === original.fin;
+
+          if (samePT && sameFecha && sameInicio && sameFin) {
+            return {
+              ...item,
+              tipo: updatedPayload.tipo,
+              inicio: updatedPayload.inicio,
+              fin: updatedPayload.fin,
+              ssee: updatedPayload.ssee,
+              comp: updatedPayload.comp,
+              desc: updatedPayload.desc,
+              obs: updatedPayload.obs,
+              prog: updatedPayload.prog,
+              aviso: updatedPayload.aviso,
+              sodi: updatedPayload.sodi,
+              estado: updatedPayload.estado,
+              fInicio: updatedPayload.fInicio,
+              fFin: updatedPayload.fFin,
+            };
+          }
+
+          return item;
+        })
+      );
+
+      if (oldEstado !== "Suspendido" && editForm.estado === "Suspendido") {
+        setHistorial((prev) => [
+          {
+            id: `${trabajoSeleccionado.pt}-suspendido-${Date.now()}`,
+            tipo: "suspension",
+            pt: trabajoSeleccionado.pt,
+            fechaOrigen: trabajoSeleccionado.fecha,
+            fechaDestino: editForm.fecha,
+            motivo:
+              editForm.observacion.trim() ||
+              "Cambio de estado a Suspendido desde el calendario",
+            timestamp: formatTimestamp(new Date()),
+          },
+          ...prev,
+        ]);
+      }
+
+      mostrarToast("Cambios guardados en OPAT");
+      setSelectedId("");
+    } catch (err) {
+      console.error(err);
+      setEditError("No se pudo guardar la edición en OPAT.");
+    } finally {
+      setUpdatingDetail(false);
     }
   };
 
@@ -750,13 +904,19 @@ export default function Page() {
         <>
           <div style={styles.calendarToolbar}>
             <div style={styles.calendarNav}>
-              <button onClick={() => cambiarMes(-1)} style={styles.secondaryButton}>
+              <button
+                onClick={() => cambiarMes(-1)}
+                style={styles.secondaryButton}
+              >
                 ← Mes anterior
               </button>
               <button onClick={irHoy} style={styles.secondaryButton}>
                 Mes actual
               </button>
-              <button onClick={() => cambiarMes(1)} style={styles.secondaryButton}>
+              <button
+                onClick={() => cambiarMes(1)}
+                style={styles.secondaryButton}
+              >
                 Mes siguiente →
               </button>
             </div>
@@ -940,6 +1100,7 @@ export default function Page() {
           <table style={styles.table}>
             <thead>
               <tr style={styles.tableHeadRow}>
+                <th style={styles.th}>Tipo</th>
                 <th style={styles.th}>PT</th>
                 <th style={styles.th}>Fecha origen</th>
                 <th style={styles.th}>Fecha destino</th>
@@ -950,6 +1111,11 @@ export default function Page() {
             <tbody>
               {historial.map((item) => (
                 <tr key={item.id} style={styles.tr}>
+                  <td style={styles.td}>
+                    {item.tipo === "reprogramacion"
+                      ? "Reprogramación"
+                      : "Suspensión"}
+                  </td>
                   <td style={styles.td}>{item.pt}</td>
                   <td style={styles.td}>{item.fechaOrigen}</td>
                   <td style={styles.td}>{item.fechaDestino}</td>
@@ -968,14 +1134,15 @@ export default function Page() {
         </div>
       )}
 
-      {trabajoSeleccionado && (
+      {trabajoSeleccionado && editForm && (
         <div style={styles.modalOverlay} onClick={cerrarModal}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Detalle del trabajo</h2>
                 <div style={styles.modalSubtitle}>
-                  {trabajoSeleccionado.subestacion || "-"} · {trabajoSeleccionado.pt || "-"}
+                  {trabajoSeleccionado.subestacion || "-"} ·{" "}
+                  {trabajoSeleccionado.pt || "-"}
                 </div>
               </div>
 
@@ -984,33 +1151,148 @@ export default function Page() {
               </button>
             </div>
 
-            <div style={styles.detailGrid}>
-              <DetailItem label="Fecha" value={trabajoSeleccionado.fecha} />
-              <DetailItem label="PT" value={trabajoSeleccionado.pt} />
-              <DetailItem label="Hora inicio" value={trabajoSeleccionado.horaInicio} />
-              <DetailItem label="Hora fin" value={trabajoSeleccionado.horaFin} />
-              <DetailItem label="Subestación" value={trabajoSeleccionado.subestacion} />
-              <DetailItem label="Componente" value={trabajoSeleccionado.componente} />
-              <DetailItem label="Estado" value={trabajoSeleccionado.estado} />
-              <DetailItem label="Tipo" value={trabajoSeleccionado.tipo} />
-              <DetailItem label="Programador" value={trabajoSeleccionado.programador} />
-              <DetailItem label="Área" value={trabajoSeleccionado.area} />
+            {editError && <div style={styles.errorBox}>{editError}</div>}
+
+            <div style={styles.formGrid}>
+              <ReadOnlyField label="PT" value={trabajoSeleccionado.pt} />
+
+              <FormField label="Fecha">
+                <input
+                  type="date"
+                  value={editForm.fecha}
+                  onChange={(e) => updateEditField("fecha", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora inicio">
+                <input
+                  type="time"
+                  value={editForm.horaInicio}
+                  onChange={(e) => updateEditField("horaInicio", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora fin">
+                <input
+                  type="time"
+                  value={editForm.horaFin}
+                  onChange={(e) => updateEditField("horaFin", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Subestación">
+                <input
+                  value={editForm.subestacion}
+                  onChange={(e) =>
+                    updateEditField("subestacion", e.target.value)
+                  }
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Componente">
+                <input
+                  value={editForm.componente}
+                  onChange={(e) =>
+                    updateEditField("componente", e.target.value)
+                  }
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Estado">
+                <select
+                  value={editForm.estado}
+                  onChange={(e) => updateEditField("estado", e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="En programación">En programación</option>
+                  <option value="Autorizado">Autorizado</option>
+                  <option value="Suspendido">Suspendido</option>
+                </select>
+              </FormField>
+
+              <FormField label="Tipo">
+                <select
+                  value={editForm.tipo}
+                  onChange={(e) => updateEditField("tipo", e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="DESCONEXIÓN">DESCONEXIÓN</option>
+                  <option value="INTERVENCIÓN">INTERVENCIÓN</option>
+                  <option value="INFORMATIVA">INFORMATIVA</option>
+                  <option value="SODI DESCONEXIÓN">SODI DESCONEXIÓN</option>
+                  <option value="SODI INFORMATIVA">SODI INFORMATIVA</option>
+                  <option value="SODI DE TERCEROS">SODI DE TERCEROS</option>
+                </select>
+              </FormField>
+
+              <FormField label="Programador">
+                <input
+                  value={editForm.programador}
+                  onChange={(e) =>
+                    updateEditField("programador", e.target.value)
+                  }
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Aviso al CEN">
+                <input
+                  value={editForm.aviso}
+                  onChange={(e) => updateEditField("aviso", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="SODI">
+                <input
+                  value={editForm.sodi}
+                  onChange={(e) => updateEditField("sodi", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
             </div>
 
-            <div style={{ marginTop: 16 }}>
-              <div style={styles.detailBlock}>
-                <div style={styles.detailBlockLabel}>Actividad</div>
-                <div style={styles.detailBlockValue}>
-                  {trabajoSeleccionado.actividad || "-"}
-                </div>
-              </div>
+            <div style={{ marginTop: 14 }}>
+              <FormField label="Actividad">
+                <textarea
+                  value={editForm.actividad}
+                  onChange={(e) => updateEditField("actividad", e.target.value)}
+                  style={styles.textarea}
+                />
+              </FormField>
 
-              <div style={styles.detailBlock}>
-                <div style={styles.detailBlockLabel}>Observación</div>
-                <div style={styles.detailBlockValue}>
-                  {trabajoSeleccionado.observacion || "-"}
-                </div>
-              </div>
+              <FormField label="Observación">
+                <textarea
+                  value={editForm.observacion}
+                  onChange={(e) =>
+                    updateEditField("observacion", e.target.value)
+                  }
+                  style={styles.textarea}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button onClick={cerrarModal} style={styles.secondaryButton}>
+                Cerrar
+              </button>
+
+              <button
+                onClick={guardarEdicionTrabajo}
+                disabled={updatingDetail}
+                style={{
+                  ...styles.primaryButton,
+                  opacity: updatingDetail ? 0.7 : 1,
+                  cursor: updatingDetail ? "not-allowed" : "pointer",
+                }}
+              >
+                {updatingDetail ? "Guardando..." : "Guardar cambios"}
+              </button>
             </div>
           </div>
         </div>
@@ -1073,7 +1355,9 @@ export default function Page() {
               <FormField label="Subestación">
                 <input
                   value={newPTForm.subestacion}
-                  onChange={(e) => updateNewPTField("subestacion", e.target.value)}
+                  onChange={(e) =>
+                    updateNewPTField("subestacion", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -1081,7 +1365,9 @@ export default function Page() {
               <FormField label="Componente">
                 <input
                   value={newPTForm.componente}
-                  onChange={(e) => updateNewPTField("componente", e.target.value)}
+                  onChange={(e) =>
+                    updateNewPTField("componente", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -1116,7 +1402,9 @@ export default function Page() {
               <FormField label="Programador">
                 <input
                   value={newPTForm.programador}
-                  onChange={(e) => updateNewPTField("programador", e.target.value)}
+                  onChange={(e) =>
+                    updateNewPTField("programador", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -1142,7 +1430,9 @@ export default function Page() {
               <FormField label="Observación">
                 <textarea
                   value={newPTForm.observacion}
-                  onChange={(e) => updateNewPTField("observacion", e.target.value)}
+                  onChange={(e) =>
+                    updateNewPTField("observacion", e.target.value)
+                  }
                   style={styles.textarea}
                 />
               </FormField>
@@ -1180,7 +1470,10 @@ export default function Page() {
                 </div>
               </div>
 
-              <button onClick={cerrarMoveReasonModal} style={styles.closeButton}>
+              <button
+                onClick={cerrarMoveReasonModal}
+                style={styles.closeButton}
+              >
                 ✕
               </button>
             </div>
@@ -1197,7 +1490,10 @@ export default function Page() {
             </FormField>
 
             <div style={styles.modalActions}>
-              <button onClick={cerrarMoveReasonModal} style={styles.secondaryButton}>
+              <button
+                onClick={cerrarMoveReasonModal}
+                style={styles.secondaryButton}
+              >
                 Cancelar
               </button>
 
@@ -1233,6 +1529,21 @@ function DetailItem({
     <div style={styles.detailItem}>
       <div style={styles.detailItemLabel}>{label}</div>
       <div style={styles.detailItemValue}>{value || "-"}</div>
+    </div>
+  );
+}
+
+function ReadOnlyField({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div style={styles.field}>
+      <label style={styles.label}>{label}</label>
+      <div style={styles.readOnlyBox}>{value || "-"}</div>
     </div>
   );
 }
@@ -1364,6 +1675,18 @@ const styles: Record<string, React.CSSProperties> = {
     boxSizing: "border-box",
     resize: "vertical",
     fontFamily: "Arial, sans-serif",
+  },
+  readOnlyBox: {
+    minHeight: 42,
+    borderRadius: 10,
+    border: "1px solid #cbd5e1",
+    padding: "10px 12px",
+    fontSize: 14,
+    background: "#f8fafc",
+    width: "100%",
+    boxSizing: "border-box",
+    display: "flex",
+    alignItems: "center",
   },
   actionsRow: {
     display: "flex",
