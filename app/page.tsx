@@ -43,6 +43,21 @@ type CalendarDay = {
   inMonth: boolean;
 };
 
+type NewPTForm = {
+  pt: string;
+  fecha: string;
+  horaInicio: string;
+  horaFin: string;
+  subestacion: string;
+  componente: string;
+  actividad: string;
+  observacion: string;
+  estado: string;
+  tipo: string;
+  programador: string;
+  area: string;
+};
+
 function truncate(text: string, max = 90) {
   if (!text) return "-";
   if (text.length <= max) return text;
@@ -155,13 +170,35 @@ function estadoColor(estado: string) {
   };
 }
 
+function emptyNewPTForm(fecha = ""): NewPTForm {
+  return {
+    pt: "",
+    fecha,
+    horaInicio: "08:00",
+    horaFin: "18:00",
+    subestacion: "",
+    componente: "",
+    actividad: "",
+    observacion: "",
+    estado: "En programación",
+    tipo: "DESCONEXIÓN",
+    programador: "",
+    area: "",
+  };
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
   const [busqueda, setBusqueda] = useState("");
   const [vista, setVista] = useState<"tabla" | "calendario">("calendario");
+
+  const [newPTOpen, setNewPTOpen] = useState(false);
+  const [newPTForm, setNewPTForm] = useState<NewPTForm>(emptyNewPTForm());
+  const [newPTError, setNewPTError] = useState("");
 
   const today = new Date();
   const [monthCursor, setMonthCursor] = useState(
@@ -292,6 +329,93 @@ export default function Page() {
 
   const cerrarModal = () => {
     setSelectedId("");
+  };
+
+  const abrirNuevoPT = (fecha: string) => {
+    setNewPTError("");
+    setNewPTForm(emptyNewPTForm(fecha));
+    setNewPTOpen(true);
+  };
+
+  const cerrarNuevoPT = () => {
+    if (saving) return;
+    setNewPTOpen(false);
+    setNewPTError("");
+  };
+
+  const updateNewPTField = (field: keyof NewPTForm, value: string) => {
+    setNewPTForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const guardarNuevoPT = async () => {
+    try {
+      setNewPTError("");
+
+      if (!newPTForm.pt.trim()) {
+        setNewPTError("Debes ingresar el PT.");
+        return;
+      }
+
+      if (!newPTForm.fecha) {
+        setNewPTError("Debes ingresar la fecha.");
+        return;
+      }
+
+      setSaving(true);
+
+      const payload = {
+        pt: newPTForm.pt.trim(),
+        area: newPTForm.area.trim(),
+        tipo: newPTForm.tipo,
+        inicio: newPTForm.horaInicio,
+        fin: newPTForm.horaFin,
+        ssee: newPTForm.subestacion.trim(),
+        comp: newPTForm.componente.trim(),
+        desc: newPTForm.actividad.trim(),
+        obs: newPTForm.observacion.trim(),
+        re: "No",
+        prog: newPTForm.programador.trim(),
+        aviso: "",
+        sodi: "",
+        estado: newPTForm.estado,
+        fInicio: newPTForm.fecha,
+        fFin: newPTForm.fecha,
+        to1: "0",
+        to2: "0",
+        go1: "",
+        go2: "",
+        gop: "",
+        esSodi: "false",
+        sodiCorrelativo: "",
+        sodiPara: "",
+        sodiDe: "",
+        gm: "[]",
+      };
+
+      const res = await fetch("/api/opat/create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.success) {
+        throw new Error(json?.error || "No se pudo guardar el PT.");
+      }
+
+      setNewPTOpen(false);
+      setNewPTError("");
+
+      await cargarOPAT();
+    } catch (err) {
+      console.error(err);
+      setNewPTError("No se pudo guardar el PT en OPAT.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -426,15 +550,23 @@ export default function Page() {
                   }}
                 >
                   <div style={styles.dayHeader}>
-                    <span
-                      style={{
-                        ...styles.dayNumber,
-                        background: isToday ? "#dbeafe" : "transparent",
-                        color: isToday ? "#1d4ed8" : "#0f172a",
-                      }}
+                    <button
+                      type="button"
+                      onClick={() => abrirNuevoPT(day.iso)}
+                      style={styles.dayNumberButton}
+                      title="Crear nuevo PT en este día"
                     >
-                      {day.date.getDate()}
-                    </span>
+                      <span
+                        style={{
+                          ...styles.dayNumber,
+                          background: isToday ? "#dbeafe" : "transparent",
+                          color: isToday ? "#1d4ed8" : "#0f172a",
+                        }}
+                      >
+                        {day.date.getDate()}
+                      </span>
+                    </button>
+
                     {items.length > 0 && (
                       <span style={styles.dayCount}>{items.length}</span>
                     )}
@@ -551,10 +683,7 @@ export default function Page() {
 
       {trabajoSeleccionado && (
         <div style={styles.modalOverlay} onClick={cerrarModal}>
-          <div
-            style={styles.modal}
-            onClick={(e) => e.stopPropagation()}
-          >
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Detalle del trabajo</h2>
@@ -599,6 +728,159 @@ export default function Page() {
           </div>
         </div>
       )}
+
+      {newPTOpen && (
+        <div style={styles.modalOverlay} onClick={cerrarNuevoPT}>
+          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Nuevo PT</h2>
+                <div style={styles.modalSubtitle}>
+                  Crear trabajo manual para {newPTForm.fecha || "-"}
+                </div>
+              </div>
+
+              <button onClick={cerrarNuevoPT} style={styles.closeButton}>
+                ✕
+              </button>
+            </div>
+
+            {newPTError && <div style={styles.errorBox}>{newPTError}</div>}
+
+            <div style={styles.formGrid}>
+              <FormField label="PT">
+                <input
+                  value={newPTForm.pt}
+                  onChange={(e) => updateNewPTField("pt", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Fecha">
+                <input
+                  type="date"
+                  value={newPTForm.fecha}
+                  onChange={(e) => updateNewPTField("fecha", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora inicio">
+                <input
+                  type="time"
+                  value={newPTForm.horaInicio}
+                  onChange={(e) => updateNewPTField("horaInicio", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora fin">
+                <input
+                  type="time"
+                  value={newPTForm.horaFin}
+                  onChange={(e) => updateNewPTField("horaFin", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Subestación">
+                <input
+                  value={newPTForm.subestacion}
+                  onChange={(e) => updateNewPTField("subestacion", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Componente">
+                <input
+                  value={newPTForm.componente}
+                  onChange={(e) => updateNewPTField("componente", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Estado">
+                <select
+                  value={newPTForm.estado}
+                  onChange={(e) => updateNewPTField("estado", e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="En programación">En programación</option>
+                  <option value="Autorizado">Autorizado</option>
+                  <option value="Suspendido">Suspendido</option>
+                </select>
+              </FormField>
+
+              <FormField label="Tipo">
+                <select
+                  value={newPTForm.tipo}
+                  onChange={(e) => updateNewPTField("tipo", e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="DESCONEXIÓN">DESCONEXIÓN</option>
+                  <option value="INTERVENCIÓN">INTERVENCIÓN</option>
+                  <option value="INFORMATIVA">INFORMATIVA</option>
+                  <option value="SODI DESCONEXIÓN">SODI DESCONEXIÓN</option>
+                  <option value="SODI INFORMATIVA">SODI INFORMATIVA</option>
+                  <option value="SODI DE TERCEROS">SODI DE TERCEROS</option>
+                </select>
+              </FormField>
+
+              <FormField label="Programador">
+                <input
+                  value={newPTForm.programador}
+                  onChange={(e) => updateNewPTField("programador", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Área">
+                <input
+                  value={newPTForm.area}
+                  onChange={(e) => updateNewPTField("area", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <FormField label="Actividad">
+                <textarea
+                  value={newPTForm.actividad}
+                  onChange={(e) => updateNewPTField("actividad", e.target.value)}
+                  style={styles.textarea}
+                />
+              </FormField>
+
+              <FormField label="Observación">
+                <textarea
+                  value={newPTForm.observacion}
+                  onChange={(e) => updateNewPTField("observacion", e.target.value)}
+                  style={styles.textarea}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button onClick={cerrarNuevoPT} style={styles.secondaryButton}>
+                Cancelar
+              </button>
+
+              <button
+                onClick={guardarNuevoPT}
+                disabled={saving}
+                style={{
+                  ...styles.primaryButton,
+                  opacity: saving ? 0.7 : 1,
+                  cursor: saving ? "not-allowed" : "pointer",
+                }}
+              >
+                {saving ? "Guardando..." : "Guardar en OPAT"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -614,6 +896,21 @@ function DetailItem({
     <div style={styles.detailItem}>
       <div style={styles.detailItemLabel}>{label}</div>
       <div style={styles.detailItemValue}>{value || "-"}</div>
+    </div>
+  );
+}
+
+function FormField({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={styles.field}>
+      <label style={styles.label}>{label}</label>
+      {children}
     </div>
   );
 }
@@ -715,6 +1012,21 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     outline: "none",
     background: "#fff",
+    width: "100%",
+    boxSizing: "border-box",
+  },
+  textarea: {
+    minHeight: 96,
+    borderRadius: 10,
+    border: "1px solid #cbd5e1",
+    padding: 12,
+    fontSize: 14,
+    outline: "none",
+    background: "#fff",
+    width: "100%",
+    boxSizing: "border-box",
+    resize: "vertical",
+    fontFamily: "Arial, sans-serif",
   },
   actionsRow: {
     display: "flex",
@@ -804,6 +1116,13 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
+  },
+  dayNumberButton: {
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    margin: 0,
+    cursor: "pointer",
   },
   dayNumber: {
     fontSize: 14,
@@ -924,6 +1243,16 @@ const styles: Record<string, React.CSSProperties> = {
     boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
     padding: 20,
   },
+  modalLarge: {
+    width: "min(1100px, 100%)",
+    maxHeight: "90vh",
+    overflowY: "auto",
+    background: "#fff",
+    borderRadius: 18,
+    border: "1px solid #e2e8f0",
+    boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
+    padding: 20,
+  },
   modalHeader: {
     display: "flex",
     justifyContent: "space-between",
@@ -950,6 +1279,18 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontSize: 18,
     fontWeight: 700,
+  },
+  formGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gap: 12,
+  },
+  modalActions: {
+    marginTop: 18,
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 10,
+    flexWrap: "wrap",
   },
   detailGrid: {
     display: "grid",
