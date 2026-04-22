@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getOpatCookieOrThrow } from "@/lib/opat-session";
 
 type CreatePayload = {
   pt: string;
@@ -28,6 +29,50 @@ type CreatePayload = {
   sodiDe: string;
   gm: string;
 };
+
+function safeText(value: unknown) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function looksLikeHtml(text: string) {
+  const t = text.toLowerCase();
+  return (
+    t.includes("<html") ||
+    t.includes("<body") ||
+    t.includes("<form") ||
+    t.includes("<!doctype")
+  );
+}
+
+function looksLikeLoginPage(text: string) {
+  const t = text.toLowerCase();
+  return (
+    t.includes("login") ||
+    t.includes("usuario") ||
+    t.includes("contraseña") ||
+    t.includes("password") ||
+    t.includes("iniciar sesión") ||
+    t.includes("ingresar")
+  );
+}
+
+function detectOatFailureFromJson(json: any) {
+  const raw = JSON.stringify(json).toLowerCase();
+
+  if (
+    raw.includes("error") ||
+    raw.includes("exception") ||
+    raw.includes("deneg") ||
+    raw.includes("invalid") ||
+    raw.includes("unauthorized") ||
+    raw.includes("forbidden") ||
+    raw.includes("success\":false")
+  ) {
+    return true;
+  }
+
+  return false;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -69,6 +114,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const cookieHeader = getOpatCookieOrThrow();
+
     const formData = new FormData();
     formData.append("data", JSON.stringify(payload));
 
@@ -79,29 +126,54 @@ export async function POST(req: NextRequest) {
     const response = await fetch(url, {
       method: "POST",
       headers: {
-        cookie: req.headers.get("cookie") || "",
+        cookie: cookieHeader,
       },
       body: formData,
+      redirect: "manual",
     });
 
     const text = await response.text();
+    const rawPreview = safeText(text).slice(0, 1200);
 
-    let json: unknown = null;
+    let parsedJson: unknown = null;
+    let parsedAsJson = false;
+
     try {
-      json = JSON.parse(text);
+      parsedJson = JSON.parse(text);
+      parsedAsJson = true;
     } catch {
-      json = { raw: text };
+      parsedJson = null;
     }
 
-    return NextResponse.json({
-      success: true,
-      opatResponse: json,
-      sent: payload,
-    });
-  } catch (error) {
-    console.error("Error creando PT en OPAT:", error);
+    const sessionProblem = looksLikeHtml(text) && looksLikeLoginPage(text);
+    const explicitJsonFailure =
+      parsedAsJson && detectOatFailureFromJson(parsedJson);
+    const notOkHttp = !response.ok;
+
+    const success = !notOkHttp && !sessionProblem && !explicitJsonFailure;
+
     return NextResponse.json(
-      { success: false, error: "No se pudo guardar el PT en OPAT." },
+      {
+        success,
+        opatHttpStatus: response.status,
+        opatHttpOk: response.ok,
+        parsedAsJson,
+        sessionProblem,
+        sent: payload,
+        opatResponse: parsedJson,
+        rawPreview,
+        cookiePresent: Boolean(cookieHeader),
+      },
+      { status: success ? 200 : 500 }
+    );
+  } catch (error: any) {
+    console.error("Error creando PT en OPAT:", error);
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: error?.message || "No se pudo guardar el PT en OPAT.",
+      },
       { status: 500 }
     );
   }

@@ -1,9 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { gsAppend, gsRead, gsReplaceAll, makeId } from "@/lib/google-sheet";
+import type { PMAItem } from "@/lib/pma-types";
+import { parsePMAFile } from "@/lib/pma-parser";
 
 type OpatTrabajo = {
+  id?: string;
   pt: string;
+  zona?: string;
   area?: string;
   tipo?: string;
   inicio?: string;
@@ -13,6 +18,7 @@ type OpatTrabajo = {
   desc?: string;
   obs?: string;
   re?: string;
+  req_ro?: string;
   prog?: string;
   aviso?: string;
   sodi?: string;
@@ -29,6 +35,8 @@ type OpatTrabajo = {
   sodiPara?: string;
   sodiDe?: string;
   gm?: string;
+  ultima_modificacion?: string;
+  historial?: string;
 };
 
 type TrabajoUI = {
@@ -87,6 +95,18 @@ type EditPTForm = {
   sodi: string;
 };
 
+type SodiTercerosForm = {
+  fecha: string;
+  horaInicio: string;
+  horaFin: string;
+  subestacion: string;
+  componente: string;
+  actividad: string;
+  observacion: string;
+  programador: string;
+  aviso: string;
+};
+
 type HistoryItem = {
   id: string;
   tipo: "reprogramacion" | "suspension" | "acople";
@@ -96,6 +116,8 @@ type HistoryItem = {
   motivo: string;
   timestamp: string;
   detalle?: string;
+  usuario?: string;
+  origen?: string;
 };
 
 type ToastState = {
@@ -132,8 +154,53 @@ type EssentialPattern = {
   tokens: string[];
 };
 
+type PmaSummary = {
+  total: number;
+  pendientes: number;
+  ejecutados: number;
+  reprogramados: number;
+  anulados: number;
+  otros: number;
+};
+
+type ProgramadosSummary = {
+  total: number;
+  enProgramacion: number;
+  autorizados: number;
+  suspendidos: number;
+};
+
 const LS_ACOPLES_KEY = "cct_acoples_v1";
 const LS_HISTORIAL_KEY = "cct_historial_v1";
+const DEFAULT_USUARIO = "Nicolás Lorenzen";
+const DEFAULT_ORIGEN = "APP_CALENDARIO_CCT";
+
+const PMA_HEADERS = [
+  "id",
+  "ot",
+  "pt",
+  "subestacionOriginal",
+  "subestacionNormalizada",
+  "textoBreve",
+  "descripcionActividad",
+  "descripcion1",
+  "actividadResumen",
+  "componenteDetectado",
+  "componenteTipo",
+  "especialidad",
+  "plan",
+  "fechaBase",
+  "fechaProgramada",
+  "fecha1",
+  "fechaReprogramacionFinal",
+  "estadoOriginal",
+  "estadoNormalizado",
+  "pendiente",
+  "reprogramado",
+  "ptRepetido",
+  "mesPma",
+  "mesPmaBarra",
+];
 
 const CHILE_HOLIDAYS_2026 = [
   "2026-01-01",
@@ -292,6 +359,13 @@ function normalizeText(value: string) {
     .trim();
 }
 
+function isAssignedProgramador(programador: string) {
+  const value = String(programador || "").trim();
+  if (!value) return false;
+  if (value === "-") return false;
+  return true;
+}
+
 function compareDateTime(a: TrabajoUI, b: TrabajoUI) {
   const aKey = `${a.fecha} ${a.horaInicio || "00:00"}`;
   const bKey = `${b.fecha} ${b.horaInicio || "00:00"}`;
@@ -364,7 +438,7 @@ function buildMonthGrid(monthDate: Date): CalendarDay[] {
   return days;
 }
 
-function estadoColor(estado: string) {
+function estadoColor(estado: string, programador = "") {
   if (estado === "Autorizado") {
     return {
       background: "#edfdf3",
@@ -378,6 +452,14 @@ function estadoColor(estado: string) {
       background: "#fff1f1",
       color: "#b42318",
       border: "#f3c4c4",
+    };
+  }
+
+  if (isAssignedProgramador(programador)) {
+    return {
+      background: "#dbeafe",
+      color: "#1e3a8a",
+      border: "#93c5fd",
     };
   }
 
@@ -406,6 +488,20 @@ function emptyNewPTForm(fecha = ""): NewPTForm {
   };
 }
 
+function emptySodiTercerosForm(fecha = ""): SodiTercerosForm {
+  return {
+    fecha,
+    horaInicio: "08:00",
+    horaFin: "18:00",
+    subestacion: "",
+    componente: "",
+    actividad: "",
+    observacion: "",
+    programador: "",
+    aviso: "",
+  };
+}
+
 function buildEditForm(trabajo: TrabajoUI): EditPTForm {
   return {
     fecha: trabajo.fecha,
@@ -423,6 +519,103 @@ function buildEditForm(trabajo: TrabajoUI): EditPTForm {
   };
 }
 
+function classifyPmaStatus(item: PMAItem): keyof Omit<PmaSummary, "total"> {
+  if (item.reprogramado) return "reprogramados";
+
+  const estado = normalizeText(item.estadoOriginal || "");
+
+  if (
+    estado.includes("ejecut") ||
+    estado.includes("realiz") ||
+    estado.includes("termin")
+  ) {
+    return "ejecutados";
+  }
+
+  if (estado.includes("anul") || estado.includes("cancel")) {
+    return "anulados";
+  }
+
+  if (
+    estado.includes("pend") ||
+    estado.includes("program") ||
+    estado.includes("planific") ||
+    estado.includes("no ejecut")
+  ) {
+    return "pendientes";
+  }
+
+  return "otros";
+}
+
+function buildPmaSummary(items: PMAItem[]): PmaSummary {
+  const summary: PmaSummary = {
+    total: items.length,
+    pendientes: 0,
+    ejecutados: 0,
+    reprogramados: 0,
+    anulados: 0,
+    otros: 0,
+  };
+
+  for (const item of items) {
+    summary[classifyPmaStatus(item)] += 1;
+  }
+
+  return summary;
+}
+
+function buildProgramadosSummary(items: TrabajoUI[]): ProgramadosSummary {
+  let enProgramacion = 0;
+  let autorizados = 0;
+  let suspendidos = 0;
+
+  for (const item of items) {
+    if (item.estado === "Autorizado") {
+      autorizados += 1;
+    } else if (item.estado === "Suspendido") {
+      suspendidos += 1;
+    } else {
+      enProgramacion += 1;
+    }
+  }
+
+  return {
+    total: items.length,
+    enProgramacion,
+    autorizados,
+    suspendidos,
+  };
+}
+
+function mapPmaToSheetRow(item: PMAItem) {
+  return [
+    item.id,
+    item.ot,
+    item.pt,
+    item.subestacionOriginal,
+    item.subestacionNormalizada,
+    item.textoBreve,
+    item.descripcionActividad,
+    item.descripcion1,
+    item.actividadResumen,
+    item.componenteDetectado,
+    item.componenteTipo,
+    item.especialidad,
+    item.plan,
+    item.fechaBase,
+    item.fechaProgramada,
+    item.fecha1,
+    item.fechaReprogramacionFinal,
+    item.estadoOriginal,
+    item.estadoNormalizado,
+    item.pendiente ? "true" : "false",
+    item.reprogramado ? "true" : "false",
+    item.ptRepetido,
+    item.mesPma,
+    item.mesPmaBarra,
+  ];
+}
 function containsCenCorrelativo(value: string) {
   return /\d{8,}/.test(value || "");
 }
@@ -593,7 +786,6 @@ function detectFlexibleEssentialByRules(trabajo: TrabajoUI) {
       "polpaico",
       "kapatur",
       "ohiggins",
-      "rahu e",
       "pilauco",
       "antillanca",
       "pichirropulli",
@@ -689,7 +881,6 @@ function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
     if (!requiresCenReview(trabajo)) continue;
 
     const workDate = parseISODateLocal(trabajo.fecha);
-
     const lastDay4Business = subtractBusinessDays(workDate, 5);
     const lastDay12Calendar = subtractCalendarDays(workDate, 13);
 
@@ -746,7 +937,11 @@ function groupTrabajosByAcoples(trabajos: TrabajoUI[], groups: AcopleGroup[]) {
     const group = groups.find((g) => g.leaderId === t.id);
 
     if (group) {
-      const members = [t, ...group.memberIds.map((id) => mapById.get(id)).filter(Boolean)] as TrabajoUI[];
+      const members = [
+        t,
+        ...group.memberIds.map((id) => mapById.get(id)).filter(Boolean),
+      ] as TrabajoUI[];
+
       members.forEach((m) => alreadyGrouped.add(m.id));
       result.push({
         kind: "group",
@@ -808,22 +1003,69 @@ function saveHistorialToStorage(historial: HistoryItem[]) {
   window.localStorage.setItem(LS_HISTORIAL_KEY, JSON.stringify(historial));
 }
 
+function parseHistorialRows(rows: any[][]): HistoryItem[] {
+  return rows
+    .slice(1)
+    .filter((row) => row.some((cell) => String(cell || "").trim() !== ""))
+    .map((row) => ({
+      id: String(row[0] || ""),
+      timestamp: String(row[1] || ""),
+      tipo: String(row[2] || "") as HistoryItem["tipo"],
+      pt: String(row[3] || ""),
+      fechaOrigen: String(row[4] || ""),
+      fechaDestino: String(row[5] || ""),
+      motivo: String(row[6] || ""),
+      detalle: String(row[7] || ""),
+      usuario: String(row[8] || ""),
+      origen: String(row[9] || ""),
+    }));
+}
+
+function parseAcoplesRows(rows: any[][]): AcopleGroup[] {
+  return rows
+    .slice(1)
+    .filter((row) => row.some((cell) => String(cell || "").trim() !== ""))
+    .map((row) => ({
+      id: String(row[0] || ""),
+      leaderId: String(row[1] || ""),
+      memberIds: (() => {
+        try {
+          return JSON.parse(String(row[2] || "[]"));
+        } catch {
+          return [];
+        }
+      })(),
+      createdAt: String(row[3] || ""),
+    }));
+}
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [moving, setMoving] = useState(false);
   const [updatingDetail, setUpdatingDetail] = useState(false);
+  const [creatingSodiTerceros, setCreatingSodiTerceros] = useState(false);
+
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string>("");
   const [busqueda, setBusqueda] = useState("");
-  const [vista, setVista] = useState<"calendario" | "tabla" | "historial">(
+  const [vista, setVista] = useState<"calendario" | "tabla" | "historial" | "pma">(
     "calendario"
   );
 
   const [newPTOpen, setNewPTOpen] = useState(false);
   const [newPTForm, setNewPTForm] = useState<NewPTForm>(emptyNewPTForm());
   const [newPTError, setNewPTError] = useState("");
+
+  const [sodiTercerosOpen, setSodiTercerosOpen] = useState(false);
+  const [sodiTercerosForm, setSodiTercerosForm] = useState<SodiTercerosForm>(
+    emptySodiTercerosForm()
+  );
+  const [sodiTercerosError, setSodiTercerosError] = useState("");
+
+  const [centralityUsername, setCentralityUsername] =
+    useState("Nicolás.Lorenzen");
+  const [centralityPassword, setCentralityPassword] = useState("");
 
   const [editForm, setEditForm] = useState<EditPTForm | null>(null);
   const [editError, setEditError] = useState("");
@@ -835,6 +1077,7 @@ export default function Page() {
 
   const [historial, setHistorial] = useState<HistoryItem[]>([]);
   const [acoples, setAcoples] = useState<AcopleGroup[]>([]);
+  const [persistReady, setPersistReady] = useState(false);
 
   const [draggingId, setDraggingId] = useState<string>("");
   const [dropTargetDate, setDropTargetDate] = useState<string>("");
@@ -858,23 +1101,20 @@ export default function Page() {
   });
   const [acopleTargetId, setAcopleTargetId] = useState<string>("");
 
-  const now = new Date();
+  const [pmaData, setPmaData] = useState<PMAItem[]>([]);
+  const [pmaLoading, setPmaLoading] = useState(false);
+  const [pmaError, setPmaError] = useState("");
+  const [pmaFileName, setPmaFileName] = useState("");
+
   const today = new Date();
+  const now = new Date();
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
   );
-    useEffect(() => {
-    setAcoples(loadAcoplesFromStorage());
-    setHistorial(loadHistorialFromStorage());
-  }, []);
 
-  useEffect(() => {
-    saveAcoplesToStorage(acoples);
-  }, [acoples]);
-
-  useEffect(() => {
-    saveHistorialToStorage(historial);
-  }, [historial]);
+  const mostrarToast = (message: string) => {
+    setToast({ visible: true, message });
+  };
 
   useEffect(() => {
     if (!toast.visible) return;
@@ -884,8 +1124,80 @@ export default function Page() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  const mostrarToast = (message: string) => {
-    setToast({ visible: true, message });
+  useEffect(() => {
+    const cargarPersistencia = async () => {
+      try {
+        const [rawHistorial, rawAcoples] = await Promise.all([
+          gsRead("HistorialCambios"),
+          gsRead("Acoples"),
+        ]);
+
+        setHistorial(parseHistorialRows(rawHistorial));
+        setAcoples(parseAcoplesRows(rawAcoples));
+      } catch (gsError) {
+        console.error(
+          "No se pudo cargar Google Sheet, uso localStorage como respaldo:",
+          gsError
+        );
+        setAcoples(loadAcoplesFromStorage());
+        setHistorial(loadHistorialFromStorage());
+      } finally {
+        setPersistReady(true);
+      }
+    };
+
+    cargarPersistencia();
+  }, []);
+
+  useEffect(() => {
+    if (!persistReady) return;
+    saveAcoplesToStorage(acoples);
+  }, [acoples, persistReady]);
+
+  useEffect(() => {
+    if (!persistReady) return;
+    saveHistorialToStorage(historial);
+  }, [historial, persistReady]);
+
+  const appendHistorialPersist = async (item: HistoryItem) => {
+    try {
+      await gsAppend("HistorialCambios", [
+        item.id,
+        item.timestamp,
+        item.tipo,
+        item.pt,
+        item.fechaOrigen,
+        item.fechaDestino,
+        item.motivo,
+        item.detalle || "",
+        item.usuario || DEFAULT_USUARIO,
+        item.origen || DEFAULT_ORIGEN,
+      ]);
+    } catch (err) {
+      console.error("No se pudo guardar historial en Google Sheet:", err);
+    }
+  };
+
+  const appendAcoplePersist = async (group: AcopleGroup) => {
+    try {
+      await gsAppend("Acoples", [
+        group.id,
+        group.leaderId,
+        JSON.stringify(group.memberIds),
+        group.createdAt,
+      ]);
+    } catch (err) {
+      console.error("No se pudo guardar acople en Google Sheet:", err);
+    }
+  };
+
+  const replacePmaPersist = async (items: PMAItem[]) => {
+    try {
+      const rows = items.map(mapPmaToSheetRow);
+      await gsReplaceAll("PMAData", PMA_HEADERS, rows);
+    } catch (err) {
+      console.error("No se pudo reemplazar PMAData en Google Sheet:", err);
+    }
   };
 
   const cargarOPAT = async () => {
@@ -909,7 +1221,6 @@ export default function Page() {
       }
 
       setData(json);
-
       const actual = new Date();
       setMonthCursor(new Date(actual.getFullYear(), actual.getMonth(), 1));
     } catch (err) {
@@ -921,10 +1232,38 @@ export default function Page() {
     }
   };
 
+  const cargarArchivoPMA = async (file: File) => {
+    try {
+      setPmaLoading(true);
+      setPmaError("");
+
+      const parsed = await parsePMAFile(file);
+      setPmaData(parsed);
+      setPmaFileName(file.name);
+
+      await replacePmaPersist(parsed);
+      mostrarToast(`PMA cargado: ${parsed.length} registros`);
+    } catch (err) {
+      console.error(err);
+      setPmaError("No se pudo leer o guardar el archivo PMA.");
+    } finally {
+      setPmaLoading(false);
+    }
+  };
+
+  const onPMAFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await cargarArchivoPMA(file);
+    e.target.value = "";
+  };
+
   const trabajos = useMemo<TrabajoUI[]>(() => {
     return data
       .map((item, index) => ({
-        id: `${item.pt || "sin-pt"}-${item.fInicio || "sin-fecha"}-${index}`,
+        id:
+          item.id?.toString() ||
+          `${item.pt || "sin-pt"}-${item.fInicio || "sin-fecha"}-${index}`,
         original: item,
         fecha: item.fInicio || "",
         pt: item.pt || "",
@@ -972,6 +1311,38 @@ export default function Page() {
     });
   }, [trabajos, busqueda]);
 
+  const pmaFiltrado = useMemo(() => {
+    const q = normalizeText(busqueda);
+
+    return pmaData.filter((item) => {
+      if (!q) return true;
+
+      const texto = normalizeText(
+        [
+          item.ot,
+          item.pt,
+          item.subestacionOriginal,
+          item.subestacionNormalizada,
+          item.actividadResumen,
+          item.componenteDetectado,
+          item.componenteTipo,
+          item.especialidad,
+          item.estadoOriginal,
+          item.fechaBase,
+        ].join(" ")
+      );
+
+      return texto.includes(q);
+    });
+  }, [pmaData, busqueda]);
+
+  const pmaSummary = useMemo(() => buildPmaSummary(pmaData), [pmaData]);
+
+  const programadosSummary = useMemo(
+    () => buildProgramadosSummary(trabajosFiltrados),
+    [trabajosFiltrados]
+  );
+
   const trabajoSeleccionado =
     trabajosFiltrados.find((t) => t.id === selectedId) ||
     trabajos.find((t) => t.id === selectedId) ||
@@ -991,9 +1362,7 @@ export default function Page() {
     const map = new Map<string, TrabajoUI[]>();
     for (const t of trabajosFiltrados) {
       if (!t.fecha) continue;
-      if (!map.has(t.fecha)) {
-        map.set(t.fecha, []);
-      }
+      if (!map.has(t.fecha)) map.set(t.fecha, []);
       map.get(t.fecha)!.push(t);
     }
     return map;
@@ -1049,6 +1418,39 @@ export default function Page() {
     setNewPTError("");
     setNewPTForm(emptyNewPTForm(fecha));
     setNewPTOpen(true);
+  };
+
+  const abrirDayOverflow = (dateIso: string) => {
+    setDayOverflow({ open: true, date: dateIso });
+  };
+
+  const abrirSodiDesdeNuevoPT = () => {
+    setSodiTercerosError("");
+    setSodiTercerosForm({
+      fecha: newPTForm.fecha,
+      horaInicio: newPTForm.horaInicio,
+      horaFin: newPTForm.horaFin,
+      subestacion: newPTForm.subestacion,
+      componente: newPTForm.componente,
+      actividad: newPTForm.actividad,
+      observacion: newPTForm.observacion,
+      programador: newPTForm.programador,
+      aviso: newPTForm.aviso,
+    });
+    setNewPTOpen(false);
+    setSodiTercerosOpen(true);
+  };
+    const cerrarSodiTerceros = () => {
+    if (creatingSodiTerceros) return;
+    setSodiTercerosOpen(false);
+    setSodiTercerosError("");
+  };
+
+  const updateSodiTercerosField = (
+    field: keyof SodiTercerosForm,
+    value: string
+  ) => {
+    setSodiTercerosForm((prev) => ({ ...prev, [field]: value }));
   };
 
   const abrirCopiaDesdeTrabajo = (trabajo: TrabajoUI) => {
@@ -1147,7 +1549,7 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(json?.error || "No se pudo guardar el PT.");
+        throw new Error(json?.error || json?.opatResponse?.mensaje || "No se pudo guardar el PT.");
       }
 
       setData((prev) => [
@@ -1186,11 +1588,119 @@ export default function Page() {
       setNewPTError("");
       setNewPTForm(emptyNewPTForm());
       mostrarToast("PT guardado en OPAT");
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setNewPTError("No se pudo guardar el PT en OPAT.");
+      setNewPTError(err?.message || "No se pudo guardar el PT en OPAT.");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const guardarSodiTerceros = async () => {
+    try {
+      setSodiTercerosError("");
+
+      if (!centralityUsername.trim() || !centralityPassword.trim()) {
+        setSodiTercerosError("Debes ingresar usuario y contraseña de Centrality.");
+        return;
+      }
+
+      if (!sodiTercerosForm.fecha) {
+        setSodiTercerosError("Debes ingresar la fecha.");
+        return;
+      }
+
+      if (!sodiTercerosForm.subestacion.trim()) {
+        setSodiTercerosError("Debes ingresar la subestación.");
+        return;
+      }
+
+      if (!sodiTercerosForm.actividad.trim()) {
+        setSodiTercerosError("Debes ingresar la descripción del trabajo.");
+        return;
+      }
+
+      setCreatingSodiTerceros(true);
+
+      const centralityRes = await fetch("/api/centrality/copy-pt-base", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: centralityUsername.trim(),
+          password: centralityPassword,
+          ptBase: "2026-06560",
+        }),
+      });
+
+      const centralityJson = await centralityRes.json();
+
+      if (!centralityRes.ok || !centralityJson?.ok || !centralityJson?.newPtId) {
+        throw new Error(
+          centralityJson?.error ||
+            "No se pudo crear el SODI TERCERO en Centrality."
+        );
+      }
+
+      const nuevoPt = String(centralityJson.newPtId).trim();
+
+      const opatPayload = {
+        pt: nuevoPt,
+        area: "",
+        tipo: "SODI DE TERCEROS",
+        inicio: sodiTercerosForm.horaInicio,
+        fin: sodiTercerosForm.horaFin,
+        ssee: sodiTercerosForm.subestacion.trim(),
+        comp: sodiTercerosForm.componente.trim(),
+        desc: sodiTercerosForm.actividad.trim(),
+        obs: sodiTercerosForm.observacion.trim(),
+        re: "No",
+        prog: sodiTercerosForm.programador.trim(),
+        aviso: sodiTercerosForm.aviso.trim(),
+        sodi: nuevoPt,
+        estado: "En programación",
+        fInicio: sodiTercerosForm.fecha,
+        fFin: sodiTercerosForm.fecha,
+        to1: "0",
+        to2: "0",
+        go1: "",
+        go2: "",
+        gop: "",
+        esSodi: "true",
+        sodiCorrelativo: "",
+        sodiPara: "",
+        sodiDe: "",
+        gm: "[]",
+      };
+
+      const opatRes = await fetch("/api/opat/create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(opatPayload),
+      });
+
+      const opatJson = await opatRes.json();
+
+      if (!opatRes.ok || !opatJson?.success) {
+        throw new Error(
+          opatJson?.error || opatJson?.opatResponse?.mensaje || "Se creó en Centrality, pero falló OPAT."
+        );
+      }
+
+      await cargarOPAT();
+      setSodiTercerosOpen(false);
+      setSodiTercerosForm(emptySodiTercerosForm());
+      mostrarToast(`SODI TERCERO creado: ${nuevoPt}`);
+    } catch (err: any) {
+      console.error(err);
+      setSodiTercerosError(
+        err?.message || "No se pudo crear el SODI TERCERO."
+      );
+    } finally {
+      setCreatingSodiTerceros(false);
     }
   };
 
@@ -1213,7 +1723,7 @@ export default function Page() {
     }
   };
 
-  const onDropSobreTrabajo = (
+  const onDropSobreTrabajo = async (
     targetTrabajoId: string,
     e: React.DragEvent<HTMLButtonElement>
   ) => {
@@ -1275,28 +1785,33 @@ export default function Page() {
 
     mergedMemberIds.delete(targetTrabajoId);
 
-    nextAcoples.push({
-      id: `acople-${Date.now()}`,
+    const nuevoAcople: AcopleGroup = {
+      id: makeId("acople"),
       leaderId: targetTrabajoId,
       memberIds: Array.from(mergedMemberIds),
       createdAt: new Date().toISOString(),
-    });
+    };
 
+    nextAcoples.push(nuevoAcople);
     setAcoples(nextAcoples);
 
-    setHistorial((prev) => [
-      {
-        id: `hist-acople-${Date.now()}`,
-        tipo: "acople",
-        pt: target.pt,
-        fechaOrigen: target.fecha,
-        fechaDestino: target.fecha,
-        motivo: "Acoplamiento manual en calendario",
-        timestamp: formatTimestamp(new Date()),
-        detalle: `${dragged.pt} acoplado con ${target.pt}`,
-      },
-      ...prev,
-    ]);
+    await appendAcoplePersist(nuevoAcople);
+
+    const historialItem: HistoryItem = {
+      id: makeId("hist"),
+      tipo: "acople",
+      pt: target.pt,
+      fechaOrigen: target.fecha,
+      fechaDestino: target.fecha,
+      motivo: "Acoplamiento manual en calendario",
+      timestamp: formatTimestamp(new Date()),
+      detalle: `${dragged.pt} acoplado con ${target.pt}`,
+      usuario: DEFAULT_USUARIO,
+      origen: DEFAULT_ORIGEN,
+    };
+
+    setHistorial((prev) => [historialItem, ...prev]);
+    await appendHistorialPersist(historialItem);
 
     setDraggingId("");
     setDropTargetDate("");
@@ -1304,21 +1819,25 @@ export default function Page() {
     mostrarToast("PTs acoplados en la agenda");
   };
 
-  const desacoplarGrupo = (groupId: string, leaderPt: string, fecha: string) => {
+  const desacoplarGrupo = async (groupId: string, leaderPt: string, fecha: string) => {
     setAcoples((prev) => prev.filter((g) => g.id !== groupId));
-    setHistorial((prev) => [
-      {
-        id: `hist-desacople-${Date.now()}`,
-        tipo: "acople",
-        pt: leaderPt,
-        fechaOrigen: fecha,
-        fechaDestino: fecha,
-        motivo: "Desacople manual en calendario",
-        timestamp: formatTimestamp(new Date()),
-        detalle: `Se eliminó acople visual del grupo ${groupId}`,
-      },
-      ...prev,
-    ]);
+
+    const historialItem: HistoryItem = {
+      id: makeId("hist"),
+      tipo: "acople",
+      pt: leaderPt,
+      fechaOrigen: fecha,
+      fechaDestino: fecha,
+      motivo: "Desacople manual en calendario",
+      timestamp: formatTimestamp(new Date()),
+      detalle: `Se eliminó acople visual del grupo ${groupId}`,
+      usuario: DEFAULT_USUARIO,
+      origen: DEFAULT_ORIGEN,
+    };
+
+    setHistorial((prev) => [historialItem, ...prev]);
+    await appendHistorialPersist(historialItem);
+
     mostrarToast("Acople eliminado");
   };
 
@@ -1414,7 +1933,9 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(json?.error || "No se pudo reprogramar el PT.");
+        throw new Error(
+          json?.error || json?.opatResponse?.mensaje || "No se pudo reprogramar el PT."
+        );
       }
 
       setData((prev) =>
@@ -1436,27 +1957,31 @@ export default function Page() {
         })
       );
 
-      setHistorial((prev) => [
-        {
-          id: `${trabajo.pt}-${Date.now()}`,
-          tipo: "reprogramacion",
-          pt: trabajo.pt,
-          fechaOrigen: pendingMove.fromDate,
-          fechaDestino: pendingMove.toDate,
-          motivo,
-          timestamp: formatTimestamp(new Date()),
-        },
-        ...prev,
-      ]);
+      const historialItem: HistoryItem = {
+        id: makeId("hist"),
+        tipo: "reprogramacion",
+        pt: trabajo.pt,
+        fechaOrigen: pendingMove.fromDate,
+        fechaDestino: pendingMove.toDate,
+        motivo,
+        timestamp: formatTimestamp(new Date()),
+        usuario: DEFAULT_USUARIO,
+        origen: DEFAULT_ORIGEN,
+      };
+
+      setHistorial((prev) => [historialItem, ...prev]);
+      await appendHistorialPersist(historialItem);
 
       setMoveReasonOpen(false);
       setPendingMove(null);
       setMoveReason("");
       setMoveReasonError("");
       mostrarToast("PT reprogramado en OPAT");
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setMoveReasonError("No se pudo reprogramar el PT en OPAT.");
+      setMoveReasonError(
+        err?.message || "No se pudo reprogramar el PT en OPAT."
+      );
     } finally {
       setMoving(false);
     }
@@ -1508,7 +2033,9 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(json?.error || "No se pudo actualizar el trabajo.");
+        throw new Error(
+          json?.error || json?.opatResponse?.mensaje || "No se pudo actualizar el trabajo."
+        );
       }
 
       setData((prev) =>
@@ -1542,20 +2069,22 @@ export default function Page() {
       );
 
       if (oldEstado !== "Suspendido" && editForm.estado === "Suspendido") {
-        setHistorial((prev) => [
-          {
-            id: `${trabajoSeleccionado.pt}-suspendido-${Date.now()}`,
-            tipo: "suspension",
-            pt: trabajoSeleccionado.pt,
-            fechaOrigen: trabajoSeleccionado.fecha,
-            fechaDestino: editForm.fecha,
-            motivo:
-              (motivoSuspension || "").trim() ||
-              "Cambio de estado a Suspendido desde el calendario",
-            timestamp: formatTimestamp(new Date()),
-          },
-          ...prev,
-        ]);
+        const historialItem: HistoryItem = {
+          id: makeId("hist"),
+          tipo: "suspension",
+          pt: trabajoSeleccionado.pt,
+          fechaOrigen: trabajoSeleccionado.fecha,
+          fechaDestino: editForm.fecha,
+          motivo:
+            (motivoSuspension || "").trim() ||
+            "Cambio de estado a Suspendido desde el calendario",
+          timestamp: formatTimestamp(new Date()),
+          usuario: DEFAULT_USUARIO,
+          origen: DEFAULT_ORIGEN,
+        };
+
+        setHistorial((prev) => [historialItem, ...prev]);
+        await appendHistorialPersist(historialItem);
       }
 
       mostrarToast("Cambios guardados en OPAT");
@@ -1564,9 +2093,11 @@ export default function Page() {
       setSuspensionReason("");
       setSuspensionReasonError("");
       setPendingSuspensionSave(false);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setEditError("No se pudo guardar la edición en OPAT.");
+      setEditError(
+        err?.message || "No se pudo guardar la edición en OPAT."
+      );
     } finally {
       setUpdatingDetail(false);
     }
@@ -1627,140 +2158,135 @@ export default function Page() {
   const cerrarDayOverflow = () => {
     setDayOverflow({ open: false, date: "" });
   };
-
-  return (
+    return (
     <main style={styles.page}>
-      <div style={styles.header}>
-        <div>
-          <h1 style={styles.title}>Calendario CCT · Agenda OPAT</h1>
-          <p style={styles.subtitle}>
-            Vista mensual operativa basada en trabajos traídos desde OPAT
-          </p>
-        </div>
+      <div style={styles.headerCard}>
+        <div style={styles.headerTop}>
+          <div>
+            <h1 style={styles.title}>Calendario CCT · Agenda OPAT</h1>
+            <p style={styles.subtitle}>
+              Vista mensual operativa basada en trabajos traídos desde OPAT.
+            </p>
+          </div>
 
-        <button
-          onClick={cargarOPAT}
-          disabled={loading}
-          style={{
-            ...styles.primaryButton,
-            opacity: loading ? 0.7 : 1,
-            cursor: loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading ? "Cargando..." : "Cargar OPAT"}
-        </button>
+          <div style={styles.headerButtons}>
+            <button
+              onClick={cargarOPAT}
+              disabled={loading}
+              style={{
+                ...styles.primaryBlueButton,
+                opacity: loading ? 0.7 : 1,
+                cursor: loading ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? "Cargando..." : "Cargar OPAT"}
+            </button>
+
+            <label style={styles.secondaryButton}>
+              {pmaLoading ? "Cargando PMA..." : "Cargar PMA CSV"}
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                onChange={onPMAFileChange}
+                style={{ display: "none" }}
+              />
+            </label>
+          </div>
+        </div>
       </div>
 
       <div style={styles.summaryRow}>
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>Total cargados</span>
-          <strong style={styles.summaryValue}>{trabajos.length}</strong>
+          <strong style={styles.summaryValue}>
+            {vista === "pma" ? pmaData.length : trabajos.length}
+          </strong>
         </div>
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>Mostrados</span>
-          <strong style={styles.summaryValue}>{trabajosFiltrados.length}</strong>
+          <strong style={styles.summaryValue}>
+            {vista === "pma" ? pmaFiltrado.length : trabajosFiltrados.length}
+          </strong>
         </div>
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>En mes visible</span>
-          <strong style={styles.summaryValue}>{trabajosMesActual.length}</strong>
+          <strong style={styles.summaryValue}>
+            {vista === "pma" ? pmaData.length : trabajosMesActual.length}
+          </strong>
         </div>
       </div>
 
-      {trabajos.length > 0 && (
-        <div style={styles.alertsWrap}>
-          <div style={styles.alertBox}>
-            <div style={styles.alertHeader}>
-              <div>
-                <div style={styles.alertTitle}>Avisos CEN por 4 días hábiles</div>
-                <div style={styles.alertSubtitle}>
-                  Último día operativo: {toLocalDateInputValue(cenAlerts.effectiveToday)}
-                </div>
-              </div>
-              <div style={styles.alertCount}>{cenAlerts.normal.length}</div>
-            </div>
+      {trabajos.length > 0 && vista !== "pma" && (
+        <div style={styles.alertsWrapNew}>
+          <section style={styles.alertBoxNew}>
+            <div style={styles.alertCounterAmber}>{cenAlerts.normal.length}</div>
 
-            {cenAlerts.normal.length === 0 ? (
-              <div style={styles.alertEmpty}>
-                Hoy no hay trabajos que venzan por la regla de 4 días hábiles.
-              </div>
-            ) : (
-              <div style={styles.alertList}>
-                {cenAlerts.normal.slice(0, 6).map((item) => (
+            <h2 style={styles.alertTitleNew}>Avisos CEN por 4 días hábiles</h2>
+            <p style={styles.alertSubtitleNew}>
+              Último día operativo: {toLocalDateInputValue(cenAlerts.effectiveToday)}
+            </p>
+
+            <div style={styles.alertListNew}>
+              {cenAlerts.normal.length === 0 ? (
+                <div style={styles.alertEmptyNew}>
+                  Hoy no hay trabajos que venzan por la regla de 4 días hábiles.
+                </div>
+              ) : (
+                cenAlerts.normal.slice(0, 6).map((item) => (
                   <button
                     key={item.id}
                     type="button"
                     onClick={() => irAlTrabajoDesdeAlerta(item)}
-                    style={styles.alertItemButton}
+                    style={styles.alertItemButtonNew}
                   >
-                    <div style={styles.alertItem}>
-                      <div style={styles.alertItemPt}>{item.pt}</div>
-                      <div style={styles.alertItemMeta}>
-                        {item.fecha} · {item.subestacion || "-"}
-                      </div>
-                      <div style={styles.alertItemDesc}>
-                        {truncate(item.componente || item.actividad || "-", 80)}
-                      </div>
+                    <div style={styles.alertItemPt}>{item.pt}</div>
+                    <div style={styles.alertItemMeta}>
+                      {item.fecha} · {item.subestacion || "-"}
+                    </div>
+                    <div style={styles.alertItemDesc}>
+                      {truncate(item.componente || item.actividad || "-", 80)}
                     </div>
                   </button>
-                ))}
-                {cenAlerts.normal.length > 6 && (
-                  <div style={styles.alertMore}>
-                    +{cenAlerts.normal.length - 6} trabajo(s) más
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          <div style={styles.alertBoxEssential}>
-            <div style={styles.alertHeader}>
-              <div>
-                <div style={styles.alertTitle}>Avisos CEN instalaciones esenciales</div>
-                <div style={styles.alertSubtitle}>
-                  Regla de 12 días corridos · corte 07:00
-                </div>
-              </div>
-              <div style={styles.alertCountEssential}>
-                {cenAlerts.essential.length}
-              </div>
+                ))
+              )}
             </div>
+          </section>
 
-            {cenAlerts.essential.length === 0 ? (
-              <div style={styles.alertEmpty}>
-                Hoy no hay trabajos esenciales que venzan por la regla de 12 días.
-              </div>
-            ) : (
-              <div style={styles.alertList}>
-                {cenAlerts.essential.slice(0, 6).map((item) => (
+          <section style={styles.alertBoxEssentialNew}>
+            <div style={styles.alertCounterRed}>{cenAlerts.essential.length}</div>
+
+            <h2 style={styles.alertTitleNew}>Avisos CEN instalaciones esenciales</h2>
+            <p style={styles.alertSubtitleNew}>Regla de 12 días corridos · corte 07:00</p>
+
+            <div style={styles.alertListNew}>
+              {cenAlerts.essential.length === 0 ? (
+                <div style={styles.alertEmptyNew}>
+                  Hoy no hay trabajos esenciales que venzan por la regla de 12 días.
+                </div>
+              ) : (
+                cenAlerts.essential.slice(0, 6).map((item) => (
                   <button
                     key={item.id}
                     type="button"
                     onClick={() => irAlTrabajoDesdeAlerta(item)}
-                    style={styles.alertItemButton}
+                    style={styles.alertItemButtonNew}
                   >
-                    <div style={styles.alertItem}>
-                      <div style={styles.alertItemPt}>{item.pt}</div>
-                      <div style={styles.alertItemMeta}>
-                        {item.fecha} · {item.subestacion || "-"}
-                      </div>
-                      <div style={styles.alertItemDesc}>
-                        {truncate(item.componente || item.actividad || "-", 80)}
-                      </div>
+                    <div style={styles.alertItemPt}>{item.pt}</div>
+                    <div style={styles.alertItemMeta}>
+                      {item.fecha} · {item.subestacion || "-"}
+                    </div>
+                    <div style={styles.alertItemDesc}>
+                      {truncate(item.componente || item.actividad || "-", 80)}
                     </div>
                   </button>
-                ))}
-                {cenAlerts.essential.length > 6 && (
-                  <div style={styles.alertMore}>
-                    +{cenAlerts.essential.length - 6} trabajo(s) más
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+                ))
+              )}
+            </div>
+          </section>
         </div>
       )}
 
-      <div style={styles.filtersBox}>
+      <div style={styles.filtersCard}>
         <div style={styles.filtersGridSimple}>
           <div style={styles.field}>
             <label style={styles.label}>Buscar</label>
@@ -1768,7 +2294,7 @@ export default function Page() {
               type="text"
               value={busqueda}
               onChange={(e) => setBusqueda(e.target.value)}
-              placeholder="PT, subestación, componente..."
+              placeholder="PT, subestación, componente, OT..."
               style={styles.input}
             />
           </div>
@@ -1803,107 +2329,413 @@ export default function Page() {
             >
               Historial
             </button>
+            <button
+              onClick={() => setVista("pma")}
+              style={{
+                ...styles.segmentButton,
+                ...(vista === "pma" ? styles.segmentButtonActive : {}),
+              }}
+            >
+              PMA
+            </button>
           </div>
 
-          <button onClick={limpiarBusqueda} style={styles.secondaryButton}>
-            Limpiar búsqueda
-          </button>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            {pmaFileName ? <span style={styles.fileBadge}>{pmaFileName}</span> : null}
+            <button onClick={limpiarBusqueda} style={styles.secondaryButton}>
+              Limpiar búsqueda
+            </button>
+          </div>
         </div>
       </div>
 
       {error && <div style={styles.errorBox}>{error}</div>}
+      {pmaError && <div style={styles.errorBox}>{pmaError}</div>}
 
-      {!loading && !error && trabajos.length === 0 && (
+      {!loading && !error && trabajos.length === 0 && vista !== "pma" && (
         <div style={styles.emptyBox}>
           Presiona <strong>Cargar OPAT</strong> para traer la agenda.
         </div>
       )}
 
-      {trabajos.length > 0 && vista === "calendario" && (
+      {vista === "pma" && (
         <>
-          <div style={styles.calendarToolbar}>
+          <div style={styles.pmaChartsWrap}>
+            <div style={styles.pmaChartCard}>
+              <div style={styles.pmaChartHeader}>
+                <h2 style={styles.pmaChartTitle}>Avance PMA</h2>
+                <div style={styles.pmaChartSubtitle}>
+                  Resumen según estado del archivo PMA cargado
+                </div>
+              </div>
+
+              <div style={styles.pmaKpiRow}>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Total</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.total}</strong>
+                </div>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Pendientes</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.pendientes}</strong>
+                </div>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Ejecutados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.ejecutados}</strong>
+                </div>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Reprogramados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.reprogramados}</strong>
+                </div>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Anulados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.anulados}</strong>
+                </div>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Otros</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.otros}</strong>
+                </div>
+              </div>
+
+              <div style={styles.pmaBarsWrap}>
+                {[
+                  { key: "pendientes", label: "Pendientes", value: pmaSummary.pendientes },
+                  { key: "ejecutados", label: "Ejecutados", value: pmaSummary.ejecutados },
+                  { key: "reprogramados", label: "Reprogramados", value: pmaSummary.reprogramados },
+                  { key: "anulados", label: "Anulados", value: pmaSummary.anulados },
+                  { key: "otros", label: "Otros", value: pmaSummary.otros },
+                ].map((item) => {
+                  const max = Math.max(
+                    pmaSummary.pendientes,
+                    pmaSummary.ejecutados,
+                    pmaSummary.reprogramados,
+                    pmaSummary.anulados,
+                    pmaSummary.otros,
+                    1
+                  );
+                  const widthPct = (item.value / max) * 100;
+
+                  return (
+                    <div key={item.key} style={styles.pmaBarRow}>
+                      <div style={styles.pmaBarLabel}>{item.label}</div>
+                      <div style={styles.pmaBarTrack}>
+                        <div
+                          style={{
+                            ...styles.pmaBarFill,
+                            width: `${widthPct}%`,
+                          }}
+                        />
+                      </div>
+                      <div style={styles.pmaBarValue}>{item.value}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr style={styles.tableHeadRow}>
+                  <th style={styles.th}>OT</th>
+                  <th style={styles.th}>PT</th>
+                  <th style={styles.th}>Subestación</th>
+                  <th style={styles.th}>Componente detectado</th>
+                  <th style={styles.th}>Tipo</th>
+                  <th style={styles.th}>Actividad</th>
+                  <th style={styles.th}>Especialidad</th>
+                  <th style={styles.th}>Fecha base</th>
+                  <th style={styles.th}>Estado</th>
+                  <th style={styles.th}>Reprogramado</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pmaFiltrado.map((item) => (
+                  <tr key={item.id} style={styles.tr}>
+                    <td style={styles.td}>{item.ot || "-"}</td>
+                    <td style={styles.td}>{item.pt || "-"}</td>
+                    <td style={styles.td}>{item.subestacionOriginal || "-"}</td>
+                    <td style={styles.td}>{item.componenteDetectado || "-"}</td>
+                    <td style={styles.td}>{item.componenteTipo || "-"}</td>
+                    <td style={styles.td} title={item.actividadResumen || "-"}>
+                      {truncate(item.actividadResumen, 90)}
+                    </td>
+                    <td style={styles.td}>{item.especialidad || "-"}</td>
+                    <td style={styles.td}>{item.fechaBase || "-"}</td>
+                    <td style={styles.td}>{item.estadoOriginal || "-"}</td>
+                    <td style={styles.td}>{item.reprogramado ? "Sí" : "No"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {pmaFiltrado.length === 0 && (
+              <div style={styles.emptyInner}>
+                {pmaData.length === 0
+                  ? "Carga un archivo PMA CSV para visualizar la tabla."
+                  : "No hay registros PMA que coincidan con la búsqueda."}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {vista === "tabla" && (
+        <>
+          <div style={styles.programadosWrap}>
+            <div style={styles.programadosCard}>
+              <div style={styles.programadosHeader}>
+                <h2 style={styles.programadosTitle}>Avance Trabajos Programados</h2>
+                <div style={styles.programadosSubtitle}>
+                  Resumen de PTs actualmente visibles en la tabla
+                </div>
+              </div>
+
+              <div style={styles.programadosKpiRow}>
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Total PTs cargados</span>
+                  <strong style={styles.programadosKpiValue}>{programadosSummary.total}</strong>
+                </div>
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>En programación</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.enProgramacion}
+                  </strong>
+                </div>
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Autorizados</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.autorizados}
+                  </strong>
+                </div>
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Suspendidos</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.suspendidos}
+                  </strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr style={styles.tableHeadRow}>
+                  <th style={styles.th}>Fecha</th>
+                  <th style={styles.th}>PT</th>
+                  <th style={styles.th}>Hora</th>
+                  <th style={styles.th}>Subestación</th>
+                  <th style={styles.th}>Componente</th>
+                  <th style={styles.th}>Actividad</th>
+                  <th style={styles.th}>Programador</th>
+                  <th style={styles.th}>Estado</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trabajosFiltrados.map((trabajo) => (
+                  <tr
+                    key={trabajo.id}
+                    onClick={() => setSelectedId(trabajo.id)}
+                    style={{
+                      ...styles.tr,
+                      cursor: "pointer",
+                      background:
+                        trabajo.estado === "En programación" && isAssignedProgramador(trabajo.programador)
+                          ? "#eff6ff"
+                          : "transparent",
+                    }}
+                  >
+                    <td style={styles.td}>{trabajo.fecha || "-"}</td>
+                    <td style={styles.td}>{trabajo.pt || "-"}</td>
+                    <td style={styles.td}>
+                      {trabajo.horaInicio || "-"}{" "}
+                      {trabajo.horaFin ? `- ${trabajo.horaFin}` : ""}
+                    </td>
+                    <td style={styles.td}>{trabajo.subestacion || "-"}</td>
+                    <td style={styles.td}>{trabajo.componente || "-"}</td>
+                    <td style={styles.td}>{truncate(trabajo.actividad, 85)}</td>
+                    <td style={styles.td}>{trabajo.programador || "-"}</td>
+                    <td style={styles.td}>
+                      <span
+                        style={{
+                          ...styles.estadoChip,
+                          background: estadoColor(trabajo.estado, trabajo.programador).background,
+                          color: estadoColor(trabajo.estado, trabajo.programador).color,
+                          border: `1px solid ${estadoColor(trabajo.estado, trabajo.programador).border}`,
+                        }}
+                      >
+                        {trabajo.estado || "-"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {trabajosFiltrados.length === 0 && (
+              <div style={styles.emptyInner}>
+                No hay trabajos que coincidan con la búsqueda.
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {vista === "historial" && (
+        <div style={styles.tableWrap}>
+          <table style={styles.table}>
+            <thead>
+              <tr style={styles.tableHeadRow}>
+                <th style={styles.th}>Tipo</th>
+                <th style={styles.th}>PT</th>
+                <th style={styles.th}>Fecha origen</th>
+                <th style={styles.th}>Fecha destino</th>
+                <th style={styles.th}>Motivo</th>
+                <th style={styles.th}>Detalle</th>
+                <th style={styles.th}>Fecha registro</th>
+                <th style={styles.th}>Usuario</th>
+                <th style={styles.th}>Origen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {historial.map((item) => (
+                <tr key={item.id} style={styles.tr}>
+                  <td style={styles.td}>
+                    {item.tipo === "reprogramacion"
+                      ? "Reprogramación"
+                      : item.tipo === "suspension"
+                      ? "Suspensión"
+                      : "Acople"}
+                  </td>
+                  <td style={styles.td}>{item.pt}</td>
+                  <td style={styles.td}>{item.fechaOrigen}</td>
+                  <td style={styles.td}>{item.fechaDestino}</td>
+                  <td style={styles.td}>{item.motivo}</td>
+                  <td style={styles.td}>{item.detalle || "-"}</td>
+                  <td style={styles.td}>{item.timestamp}</td>
+                  <td style={styles.td}>{item.usuario || "-"}</td>
+                  <td style={styles.td}>{item.origen || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {historial.length === 0 && (
+            <div style={styles.emptyInner}>
+              Aún no hay cambios históricos registrados.
+            </div>
+          )}
+        </div>
+      )}
+
+      {vista === "calendario" && trabajos.length > 0 && (
+        <>
+          <div style={styles.calendarToolbarNew}>
+            <div>
+              <h2 style={styles.calendarMainTitle}>Calendario operativo</h2>
+              <div style={styles.calendarMonthLabel}>{formatMonthLabel(monthCursor)}</div>
+            </div>
+
             <div style={styles.calendarNav}>
-              <button
-                onClick={() => cambiarMes(-1)}
-                style={styles.secondaryButton}
-              >
+              <button onClick={() => cambiarMes(-1)} style={styles.secondaryButton}>
                 ← Mes anterior
               </button>
               <button onClick={irHoy} style={styles.secondaryButton}>
                 Mes actual
               </button>
-              <button
-                onClick={() => cambiarMes(1)}
-                style={styles.secondaryButton}
-              >
+              <button onClick={() => cambiarMes(1)} style={styles.secondaryButton}>
                 Mes siguiente →
               </button>
             </div>
-
-            <div style={styles.calendarTitle}>
-              {formatMonthLabel(monthCursor)}
-            </div>
           </div>
 
-          <div style={styles.calendarWrap}>
-            <div style={styles.weekHeader}>Lun</div>
-            <div style={styles.weekHeader}>Mar</div>
-            <div style={styles.weekHeader}>Mié</div>
-            <div style={styles.weekHeader}>Jue</div>
-            <div style={styles.weekHeader}>Vie</div>
-            <div style={styles.weekHeader}>Sáb</div>
-            <div style={styles.weekHeader}>Dom</div>
-                        {diasMes.map((day) => {
+          <div style={styles.calendarWrapNew}>
+            {["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"].map((day) => (
+              <div key={day} style={styles.weekHeaderBlack}>
+                {day}
+              </div>
+            ))}
+
+            {diasMes.map((day) => {
               const groupedItems = gruposPorFecha.get(day.iso) || [];
               const isToday = day.iso === toLocalDateInputValue(today);
-              const isDropTarget = dropTargetDate === day.iso && draggingId;
+              const isDropTarget = dropTargetDate === day.iso && !!draggingId;
 
               return (
                 <div
                   key={day.iso}
+                  onClick={() => abrirDayOverflow(day.iso)}
                   onDragOver={(e) => onDragOverDay(day.iso, e)}
                   onDrop={(e) => onDropDay(day.iso, e)}
                   style={{
-                    ...styles.dayCell,
+                    ...styles.dayCellNew,
                     background: day.inMonth ? "#fff" : "#f8fafc",
-                    opacity: day.inMonth ? 1 : 0.65,
-                    borderColor: isDropTarget
-                      ? "#16a34a"
+                    opacity: day.inMonth ? 1 : 0.7,
+                    border: isDropTarget
+                      ? "1px solid #16a34a"
                       : isToday
-                      ? "#3b82f6"
-                      : "#e2e8f0",
+                      ? "1px solid #93c5fd"
+                      : "1px solid #d6dfec",
                     boxShadow: isDropTarget
                       ? "inset 0 0 0 2px rgba(22,163,74,0.18)"
+                      : groupedItems.length > 0
+                      ? "0 8px 20px rgba(15, 23, 42, 0.06)"
                       : "none",
+                    cursor: "pointer",
                   }}
                 >
-                  <div style={styles.dayHeader}>
+                  <div style={styles.dayHeaderNew}>
                     <button
                       type="button"
-                      onClick={() => abrirNuevoPT(day.iso)}
-                      style={styles.dayNumberButton}
-                      title="Crear nuevo PT en este día"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        abrirDayOverflow(day.iso);
+                      }}
+                      style={styles.dayNumberButtonNew}
+                      title="Ver trabajos del día"
                     >
                       <span
                         style={{
-                          ...styles.dayNumber,
+                          ...styles.dayNumberNew,
                           background: isToday ? "#dbeafe" : "transparent",
-                          color: isToday ? "#1d4ed8" : "#0f172a",
+                          color: isToday ? "#1d4ed8" : day.inMonth ? "#0f172a" : "#94a3b8",
+                          padding: isToday ? "2px 10px" : 0,
                         }}
                       >
                         {day.date.getDate()}
                       </span>
                     </button>
 
-                    {groupedItems.length > 0 && (
-                      <span style={styles.dayCount}>{groupedItems.length}</span>
-                    )}
+                    <div style={styles.dayHeaderActions}>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          abrirNuevoPT(day.iso);
+                        }}
+                        style={styles.addDayButton}
+                        title="Crear nuevo PT"
+                      >
+                        +
+                      </button>
+
+                      {groupedItems.length > 0 && (
+                        <span style={styles.dayCountNew}>{groupedItems.length}</span>
+                      )}
+                    </div>
                   </div>
 
-                  <div style={styles.dayItems}>
+                  {groupedItems.length > 0 ? (
+                    <div style={styles.dayBadgesRow}>
+                      <span style={styles.tinyBadgeBlue}>{groupedItems.length} PT</span>
+                    </div>
+                  ) : null}
+
+                  <div style={styles.dayItemsNew}>
                     {groupedItems.slice(0, 4).map((entry) => {
                       const trabajo = entry.leader;
-                      const colors = estadoColor(trabajo.estado);
+                      const colors = estadoColor(trabajo.estado, trabajo.programador);
                       const isAcopleTarget = acopleTargetId === trabajo.id;
 
                       if (entry.kind === "group") {
@@ -1911,7 +2743,7 @@ export default function Page() {
                           <div
                             key={entry.groupId}
                             style={{
-                              ...styles.groupCard,
+                              ...styles.groupCardNew,
                               background: colors.background,
                               border: `1px solid ${colors.border}`,
                               boxShadow: isAcopleTarget
@@ -1928,61 +2760,72 @@ export default function Page() {
                               onDragLeave={() => onDragLeaveTrabajoCard(trabajo.id)}
                               onDragOver={(e) => e.preventDefault()}
                               onDrop={(e) => onDropSobreTrabajo(trabajo.id, e)}
-                              onClick={() => setSelectedId(trabajo.id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedId(trabajo.id);
+                              }}
                               style={{
-                                ...styles.eventCardCompact,
+                                ...styles.eventCardCompactNew,
                                 background: "transparent",
                                 color: colors.color,
                                 border: "none",
                                 padding: 0,
                               }}
-                              title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
                             >
                               <div style={styles.groupHeaderRow}>
-                                <div style={styles.eventCompactSub}>
+                                <div style={styles.eventCompactSubNew}>
                                   {truncateSoft(trabajo.subestacion || "-", 24)}
                                 </div>
-                                <span style={styles.groupBadge}>
+                                <span style={styles.groupBadgeNew}>
                                   {entry.members.length} PT
                                 </span>
                               </div>
 
-                              <div style={styles.eventCompactPt}>
+                              <div style={styles.eventCompactPtNew}>
                                 {trabajo.pt || "Sin PT"}
                               </div>
 
-                              <div style={styles.eventCompactComp}>
-                                {truncateSoft(trabajo.componente || "-", 28)}
+                              <div style={styles.eventCompactCompNew}>
+                                {truncateSoft(
+                                  trabajo.componente || trabajo.actividad || "-",
+                                  28
+                                )}
                               </div>
                             </button>
 
-                            <div style={styles.groupMembers}>
+                            <div style={styles.groupMembersNew}>
                               {entry.members.slice(1).map((m) => (
                                 <button
                                   key={m.id}
                                   type="button"
-                                  onClick={() => setSelectedId(m.id)}
-                                  style={styles.groupMemberButton}
-                                  title={`${m.subestacion} · ${m.pt} · ${m.componente}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSelectedId(m.id);
+                                  }}
+                                  style={styles.groupMemberButtonNew}
                                 >
-                                  <div style={styles.groupMemberPt}>{m.pt}</div>
-                                  <div style={styles.groupMemberComp}>
-                                    {truncateSoft(m.componente || m.actividad || "-", 24)}
+                                  <div style={styles.groupMemberPtNew}>{m.pt}</div>
+                                  <div style={styles.groupMemberCompNew}>
+                                    {truncateSoft(
+                                      m.componente || m.actividad || "-",
+                                      24
+                                    )}
                                   </div>
                                 </button>
                               ))}
                             </div>
 
-                            <div style={styles.groupActions}>
+                            <div style={styles.groupActionsNew}>
                               <button
                                 type="button"
-                                onClick={() =>
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   desacoplarGrupo(
                                     entry.groupId || "",
                                     trabajo.pt,
                                     trabajo.fecha
-                                  )
-                                }
+                                  );
+                                }}
                                 style={styles.unlinkButton}
                               >
                                 Desacoplar
@@ -2002,9 +2845,12 @@ export default function Page() {
                           onDragLeave={() => onDragLeaveTrabajoCard(trabajo.id)}
                           onDragOver={(e) => e.preventDefault()}
                           onDrop={(e) => onDropSobreTrabajo(trabajo.id, e)}
-                          onClick={() => setSelectedId(trabajo.id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedId(trabajo.id);
+                          }}
                           style={{
-                            ...styles.eventCardCompact,
+                            ...styles.eventCardCompactNew,
                             background: colors.background,
                             color: colors.color,
                             border: `1px solid ${colors.border}`,
@@ -2013,33 +2859,48 @@ export default function Page() {
                               ? "0 0 0 2px rgba(251,191,36,0.35)"
                               : "none",
                           }}
-                          title={`${trabajo.subestacion} · ${trabajo.pt} · ${trabajo.componente}`}
                         >
-                          <div style={styles.eventCompactSub}>
+                          <div style={styles.eventCompactSubNew}>
                             {truncateSoft(trabajo.subestacion || "-", 24)}
                           </div>
 
-                          <div style={styles.eventCompactPt}>
+                          <div style={styles.eventCompactPtNew}>
                             {trabajo.pt || "Sin PT"}
                           </div>
 
-                          <div style={styles.eventCompactComp}>
-                            {truncateSoft(trabajo.componente || "-", 28)}
+                          <div style={styles.eventCompactCompNew}>
+                            {truncateSoft(
+                              trabajo.componente || trabajo.actividad || "-",
+                              28
+                            )}
                           </div>
                         </button>
                       );
                     })}
-
-                    {groupedItems.length > 4 && (
-                      <button
-                        type="button"
-                        onClick={() => setDayOverflow({ open: true, date: day.iso })}
-                        style={styles.moreItemsButton}
-                      >
-                        +{groupedItems.length - 4} trabajo(s) más
-                      </button>
-                    )}
                   </div>
+
+                  {groupedItems.length > 0 ? (
+                    <div style={styles.dayFooterNew}>
+                      <div style={styles.dayFooterText}>
+                        {groupedItems.length} trabajo(s)
+                      </div>
+
+                      {groupedItems.length > 4 ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            abrirDayOverflow(day.iso);
+                          }}
+                          style={styles.moreItemsButtonNew}
+                        >
+                          +{groupedItems.length - 4} más
+                        </button>
+                      ) : (
+                        <div />
+                      )}
+                    </div>
+                  ) : null}
                 </div>
               );
             })}
@@ -2047,123 +2908,14 @@ export default function Page() {
         </>
       )}
 
-      {trabajos.length > 0 && vista === "tabla" && (
-        <div style={styles.tableWrap}>
-          <table style={styles.table}>
-            <thead>
-              <tr style={styles.tableHeadRow}>
-                <th style={styles.th}>Fecha</th>
-                <th style={styles.th}>PT</th>
-                <th style={styles.th}>Hora</th>
-                <th style={styles.th}>Subestación</th>
-                <th style={styles.th}>Componente</th>
-                <th style={styles.th}>Actividad</th>
-                <th style={styles.th}>Estado</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trabajosFiltrados.map((trabajo) => {
-                const selected = trabajo.id === selectedId;
-
-                return (
-                  <tr
-                    key={trabajo.id}
-                    onClick={() => setSelectedId(trabajo.id)}
-                    style={{
-                      ...styles.tr,
-                      background: selected ? "#eef4ff" : "#fff",
-                      cursor: "pointer",
-                    }}
-                    title="Haz clic para ver detalle"
-                  >
-                    <td style={styles.td}>{trabajo.fecha || "-"}</td>
-                    <td style={styles.td}>{trabajo.pt || "-"}</td>
-                    <td style={styles.td}>
-                      {trabajo.horaInicio || "-"}{" "}
-                      {trabajo.horaFin ? `- ${trabajo.horaFin}` : ""}
-                    </td>
-                    <td style={styles.td}>{trabajo.subestacion || "-"}</td>
-                    <td style={styles.td}>{trabajo.componente || "-"}</td>
-                    <td style={styles.td} title={trabajo.actividad || "-"}>
-                      {truncate(trabajo.actividad, 85)}
-                    </td>
-                    <td style={styles.td}>
-                      <span
-                        style={{
-                          ...styles.estadoChip,
-                          background: estadoColor(trabajo.estado).background,
-                          color: estadoColor(trabajo.estado).color,
-                        }}
-                      >
-                        {trabajo.estado || "-"}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-
-          {trabajosFiltrados.length === 0 && (
-            <div style={styles.emptyInner}>
-              No hay trabajos que coincidan con la búsqueda.
-            </div>
-          )}
-        </div>
-      )}
-
-      {vista === "historial" && (
-        <div style={styles.tableWrap}>
-          <table style={styles.table}>
-            <thead>
-              <tr style={styles.tableHeadRow}>
-                <th style={styles.th}>Tipo</th>
-                <th style={styles.th}>PT</th>
-                <th style={styles.th}>Fecha origen</th>
-                <th style={styles.th}>Fecha destino</th>
-                <th style={styles.th}>Motivo</th>
-                <th style={styles.th}>Detalle</th>
-                <th style={styles.th}>Fecha registro</th>
-              </tr>
-            </thead>
-            <tbody>
-              {historial.map((item) => (
-                <tr key={item.id} style={styles.tr}>
-                  <td style={styles.td}>
-                    {item.tipo === "reprogramacion"
-                      ? "Reprogramación"
-                      : item.tipo === "suspension"
-                      ? "Suspensión"
-                      : "Acople"}
-                  </td>
-                  <td style={styles.td}>{item.pt}</td>
-                  <td style={styles.td}>{item.fechaOrigen}</td>
-                  <td style={styles.td}>{item.fechaDestino}</td>
-                  <td style={styles.td}>{item.motivo}</td>
-                  <td style={styles.td}>{item.detalle || "-"}</td>
-                  <td style={styles.td}>{item.timestamp}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          {historial.length === 0 && (
-            <div style={styles.emptyInner}>
-              Aún no hay cambios históricos registrados.
-            </div>
-          )}
-        </div>
-      )}
-
       {trabajoSeleccionado && editForm && (
         <div style={styles.modalOverlay}>
-          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalXL} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Detalle del trabajo</h2>
                 <div style={styles.modalSubtitle}>
-                  {trabajoSeleccionado.subestacion || "-"} ·{" "}
-                  {trabajoSeleccionado.pt || "-"}
+                  {trabajoSeleccionado.subestacion || "-"} · {trabajoSeleccionado.pt || "-"}
                 </div>
               </div>
 
@@ -2174,8 +2926,14 @@ export default function Page() {
 
             {editError && <div style={styles.errorBox}>{editError}</div>}
 
-            <div style={styles.formGrid}>
-              <ReadOnlyField label="PT" value={trabajoSeleccionado.pt} />
+            <div style={styles.detailGrid4}>
+              <FormField label="PT">
+                <input
+                  value={trabajoSeleccionado.pt || ""}
+                  disabled
+                  style={styles.inputReadonly}
+                />
+              </FormField>
 
               <FormField label="Fecha">
                 <input
@@ -2207,9 +2965,7 @@ export default function Page() {
               <FormField label="Subestación">
                 <input
                   value={editForm.subestacion}
-                  onChange={(e) =>
-                    updateEditField("subestacion", e.target.value)
-                  }
+                  onChange={(e) => updateEditField("subestacion", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2217,9 +2973,7 @@ export default function Page() {
               <FormField label="Componente">
                 <input
                   value={editForm.componente}
-                  onChange={(e) =>
-                    updateEditField("componente", e.target.value)
-                  }
+                  onChange={(e) => updateEditField("componente", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2254,9 +3008,7 @@ export default function Page() {
               <FormField label="Programador">
                 <input
                   value={editForm.programador}
-                  onChange={(e) =>
-                    updateEditField("programador", e.target.value)
-                  }
+                  onChange={(e) => updateEditField("programador", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2278,27 +3030,27 @@ export default function Page() {
               </FormField>
             </div>
 
-            <div style={{ marginTop: 14 }}>
+            <div style={styles.detailBlock}>
               <FormField label="Actividad">
                 <textarea
                   value={editForm.actividad}
                   onChange={(e) => updateEditField("actividad", e.target.value)}
-                  style={styles.textarea}
-                />
-              </FormField>
-
-              <FormField label="Observación">
-                <textarea
-                  value={editForm.observacion}
-                  onChange={(e) =>
-                    updateEditField("observacion", e.target.value)
-                  }
-                  style={styles.textarea}
+                  style={styles.textareaWide}
                 />
               </FormField>
             </div>
 
-            <div style={styles.modalActions}>
+            <div style={styles.detailBlock}>
+              <FormField label="Observación">
+                <textarea
+                  value={editForm.observacion}
+                  onChange={(e) => updateEditField("observacion", e.target.value)}
+                  style={styles.textareaWide}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.modalActionsRight}>
               <button
                 onClick={() => abrirCopiaDesdeTrabajo(trabajoSeleccionado)}
                 style={styles.secondaryButton}
@@ -2314,9 +3066,8 @@ export default function Page() {
                 onClick={guardarEdicionTrabajo}
                 disabled={updatingDetail}
                 style={{
-                  ...styles.primaryButton,
+                  ...styles.primaryBlueButton,
                   opacity: updatingDetail ? 0.7 : 1,
-                  cursor: updatingDetail ? "not-allowed" : "pointer",
                 }}
               >
                 {updatingDetail ? "Guardando..." : "Guardar cambios"}
@@ -2328,7 +3079,7 @@ export default function Page() {
 
       {newPTOpen && (
         <div style={styles.modalOverlay}>
-          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalXL} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Nuevo PT</h2>
@@ -2344,7 +3095,7 @@ export default function Page() {
 
             {newPTError && <div style={styles.errorBox}>{newPTError}</div>}
 
-            <div style={styles.formGrid}>
+            <div style={styles.newPtGrid4}>
               <FormField label="PT">
                 <input
                   value={newPTForm.pt}
@@ -2383,9 +3134,7 @@ export default function Page() {
               <FormField label="Subestación">
                 <input
                   value={newPTForm.subestacion}
-                  onChange={(e) =>
-                    updateNewPTField("subestacion", e.target.value)
-                  }
+                  onChange={(e) => updateNewPTField("subestacion", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2393,9 +3142,7 @@ export default function Page() {
               <FormField label="Componente">
                 <input
                   value={newPTForm.componente}
-                  onChange={(e) =>
-                    updateNewPTField("componente", e.target.value)
-                  }
+                  onChange={(e) => updateNewPTField("componente", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2426,13 +3173,13 @@ export default function Page() {
                   <option value="SODI DE TERCEROS">SODI DE TERCEROS</option>
                 </select>
               </FormField>
+            </div>
 
+            <div style={styles.newPtGrid3}>
               <FormField label="Programador">
                 <input
                   value={newPTForm.programador}
-                  onChange={(e) =>
-                    updateNewPTField("programador", e.target.value)
-                  }
+                  onChange={(e) => updateNewPTField("programador", e.target.value)}
                   style={styles.input}
                 />
               </FormField>
@@ -2454,27 +3201,31 @@ export default function Page() {
               </FormField>
             </div>
 
-            <div style={{ marginTop: 14 }}>
+            <div style={styles.detailBlock}>
               <FormField label="Actividad">
                 <textarea
                   value={newPTForm.actividad}
                   onChange={(e) => updateNewPTField("actividad", e.target.value)}
-                  style={styles.textarea}
-                />
-              </FormField>
-
-              <FormField label="Observación">
-                <textarea
-                  value={newPTForm.observacion}
-                  onChange={(e) =>
-                    updateNewPTField("observacion", e.target.value)
-                  }
-                  style={styles.textarea}
+                  style={styles.textareaWide}
                 />
               </FormField>
             </div>
 
-            <div style={styles.modalActions}>
+            <div style={styles.detailBlock}>
+              <FormField label="Observación">
+                <textarea
+                  value={newPTForm.observacion}
+                  onChange={(e) => updateNewPTField("observacion", e.target.value)}
+                  style={styles.textareaWide}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.modalActionsRight}>
+              <button onClick={abrirSodiDesdeNuevoPT} style={styles.secondaryButton}>
+                Crear SODI TERCERO
+              </button>
+
               <button onClick={duplicarFormularioNuevo} style={styles.secondaryButton}>
                 Duplicar borrando PT
               </button>
@@ -2487,9 +3238,8 @@ export default function Page() {
                 onClick={guardarNuevoPT}
                 disabled={saving}
                 style={{
-                  ...styles.primaryButton,
+                  ...styles.primaryBlueButton,
                   opacity: saving ? 0.7 : 1,
-                  cursor: saving ? "not-allowed" : "pointer",
                 }}
               >
                 {saving ? "Guardando..." : "Guardar en OPAT"}
@@ -2499,53 +3249,170 @@ export default function Page() {
         </div>
       )}
 
-      {moveReasonOpen && pendingMove && (
+      {sodiTercerosOpen && (
         <div style={styles.modalOverlay}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
-                <h2 style={styles.modalTitle}>Reprogramar PT</h2>
+                <h2 style={styles.modalTitle}>Crear SODI TERCERO</h2>
                 <div style={styles.modalSubtitle}>
-                  {pendingMove.fromDate} → {pendingMove.toDate}
+                  Crea en Centrality y luego lo registra en OPAT
                 </div>
               </div>
 
-              <button
-                onClick={cerrarMoveReasonModal}
-                style={styles.closeButton}
-              >
+              <button onClick={cerrarSodiTerceros} style={styles.closeButton}>
                 ✕
               </button>
             </div>
 
-            {moveReasonError && (
-              <div style={styles.errorBox}>{moveReasonError}</div>
-            )}
+            {sodiTercerosError && <div style={styles.errorBox}>{sodiTercerosError}</div>}
 
-            <FormField label="Motivo del cambio">
-              <textarea
-                value={moveReason}
-                onChange={(e) => setMoveReason(e.target.value)}
-                style={styles.textarea}
-                placeholder="Ej: reprogramación por coordinación, disponibilidad, clima, etc."
-              />
-            </FormField>
+            <div style={styles.formGrid}>
+              <FormField label="Usuario Centrality">
+                <input
+                  value={centralityUsername}
+                  onChange={(e) => setCentralityUsername(e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Contraseña Centrality">
+                <input
+                  type="password"
+                  value={centralityPassword}
+                  onChange={(e) => setCentralityPassword(e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Fecha">
+                <input
+                  type="date"
+                  value={sodiTercerosForm.fecha}
+                  onChange={(e) => updateSodiTercerosField("fecha", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora inicio">
+                <input
+                  type="time"
+                  value={sodiTercerosForm.horaInicio}
+                  onChange={(e) => updateSodiTercerosField("horaInicio", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Hora fin">
+                <input
+                  type="time"
+                  value={sodiTercerosForm.horaFin}
+                  onChange={(e) => updateSodiTercerosField("horaFin", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Subestación">
+                <input
+                  value={sodiTercerosForm.subestacion}
+                  onChange={(e) => updateSodiTercerosField("subestacion", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Componente">
+                <input
+                  value={sodiTercerosForm.componente}
+                  onChange={(e) => updateSodiTercerosField("componente", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Programador">
+                <input
+                  value={sodiTercerosForm.programador}
+                  onChange={(e) => updateSodiTercerosField("programador", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Aviso">
+                <input
+                  value={sodiTercerosForm.aviso}
+                  onChange={(e) => updateSodiTercerosField("aviso", e.target.value)}
+                  style={styles.input}
+                />
+              </FormField>
+
+              <FormField label="Actividad" full>
+                <textarea
+                  value={sodiTercerosForm.actividad}
+                  onChange={(e) => updateSodiTercerosField("actividad", e.target.value)}
+                  style={{ ...styles.input, minHeight: 84, resize: "vertical" }}
+                />
+              </FormField>
+
+              <FormField label="Observación" full>
+                <textarea
+                  value={sodiTercerosForm.observacion}
+                  onChange={(e) => updateSodiTercerosField("observacion", e.target.value)}
+                  style={{ ...styles.input, minHeight: 84, resize: "vertical" }}
+                />
+              </FormField>
+            </div>
 
             <div style={styles.modalActions}>
-              <button
-                onClick={cerrarMoveReasonModal}
-                style={styles.secondaryButton}
-              >
+              <button onClick={cerrarSodiTerceros} style={styles.secondaryButton}>
                 Cancelar
               </button>
 
               <button
+                onClick={guardarSodiTerceros}
+                disabled={creatingSodiTerceros}
+                style={{
+                  ...styles.primaryDarkButton,
+                  opacity: creatingSodiTerceros ? 0.7 : 1,
+                }}
+              >
+                {creatingSodiTerceros ? "Creando..." : "Crear SODI TERCERO"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {moveReasonOpen && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modalSmall} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Motivo de reprogramación</h2>
+              </div>
+
+              <button onClick={cerrarMoveReasonModal} style={styles.closeButton}>
+                ✕
+              </button>
+            </div>
+
+            {moveReasonError && <div style={styles.errorBox}>{moveReasonError}</div>}
+
+            <textarea
+              value={moveReason}
+              onChange={(e) => setMoveReason(e.target.value)}
+              style={{ ...styles.input, minHeight: 120, resize: "vertical" }}
+              placeholder="Escribe el motivo del cambio..."
+            />
+
+            <div style={styles.modalActions}>
+              <button onClick={cerrarMoveReasonModal} style={styles.secondaryButton}>
+                Cancelar
+              </button>
+              <button
                 onClick={confirmarMovimiento}
                 disabled={moving}
                 style={{
-                  ...styles.primaryButton,
+                  ...styles.primaryBlueButton,
                   opacity: moving ? 0.7 : 1,
-                  cursor: moving ? "not-allowed" : "pointer",
                 }}
               >
                 {moving ? "Guardando..." : "Confirmar cambio"}
@@ -2555,53 +3422,38 @@ export default function Page() {
         </div>
       )}
 
-      {suspensionReasonOpen && pendingSuspensionSave && (
+      {suspensionReasonOpen && (
         <div style={styles.modalOverlay}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalSmall} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Motivo de suspensión</h2>
-                <div style={styles.modalSubtitle}>
-                  Ingresa el motivo para dejar registro en el historial
-                </div>
               </div>
 
-              <button
-                onClick={cerrarSuspensionReasonModal}
-                style={styles.closeButton}
-              >
+              <button onClick={cerrarSuspensionReasonModal} style={styles.closeButton}>
                 ✕
               </button>
             </div>
 
-            {suspensionReasonError && (
-              <div style={styles.errorBox}>{suspensionReasonError}</div>
-            )}
+            {suspensionReasonError && <div style={styles.errorBox}>{suspensionReasonError}</div>}
 
-            <FormField label="Motivo de suspensión">
-              <textarea
-                value={suspensionReason}
-                onChange={(e) => setSuspensionReason(e.target.value)}
-                style={styles.textarea}
-                placeholder="Ej: falta coordinación, condiciones de seguridad, recursos no disponibles, etc."
-              />
-            </FormField>
+            <textarea
+              value={suspensionReason}
+              onChange={(e) => setSuspensionReason(e.target.value)}
+              style={{ ...styles.input, minHeight: 120, resize: "vertical" }}
+              placeholder="Escribe el motivo de suspensión..."
+            />
 
             <div style={styles.modalActions}>
-              <button
-                onClick={cerrarSuspensionReasonModal}
-                style={styles.secondaryButton}
-              >
+              <button onClick={cerrarSuspensionReasonModal} style={styles.secondaryButton}>
                 Cancelar
               </button>
-
               <button
                 onClick={confirmarSuspensionConMotivo}
                 disabled={updatingDetail}
                 style={{
-                  ...styles.primaryButton,
+                  ...styles.primaryBlueButton,
                   opacity: updatingDetail ? 0.7 : 1,
-                  cursor: updatingDetail ? "not-allowed" : "pointer",
                 }}
               >
                 {updatingDetail ? "Guardando..." : "Confirmar suspensión"}
@@ -2613,7 +3465,7 @@ export default function Page() {
 
       {dayOverflow.open && (
         <div style={styles.modalOverlay}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={styles.modalLarge} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
               <div>
                 <h2 style={styles.modalTitle}>Trabajos del día</h2>
@@ -2625,64 +3477,44 @@ export default function Page() {
               </button>
             </div>
 
-            <div style={styles.overflowList}>
-              {(gruposPorFecha.get(dayOverflow.date) || []).map((entry, idx) => {
-                if (entry.kind === "group") {
-                  return (
-                    <div key={entry.groupId || idx} style={styles.overflowGroup}>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedId(entry.leader.id);
-                          cerrarDayOverflow();
-                        }}
-                        style={styles.overflowLeader}
-                      >
-                        <div style={styles.overflowLeaderPt}>
-                          {entry.leader.pt} · {entry.leader.subestacion || "-"}
-                        </div>
-                        <div style={styles.overflowLeaderComp}>
-                          {truncate(entry.leader.componente || entry.leader.actividad || "-", 80)}
-                        </div>
-                      </button>
+            <div style={styles.overflowActions}>
+              <button
+                onClick={() => {
+                  cerrarDayOverflow();
+                  abrirNuevoPT(dayOverflow.date);
+                }}
+                style={styles.secondaryButton}
+              >
+                Nuevo PT en este día
+              </button>
+            </div>
 
-                      <div style={styles.overflowMembers}>
-                        {entry.members.slice(1).map((m) => (
-                          <button
-                            key={m.id}
-                            type="button"
-                            onClick={() => {
-                              setSelectedId(m.id);
-                              cerrarDayOverflow();
-                            }}
-                            style={styles.overflowMember}
-                          >
-                            <div style={styles.overflowMemberPt}>{m.pt}</div>
-                            <div style={styles.overflowMemberComp}>
-                              {truncate(m.componente || m.actividad || "-", 70)}
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                }
+            <div style={styles.overflowList}>
+              {(gruposPorFecha.get(dayOverflow.date) || []).map((entry) => {
+                const trabajo = entry.leader;
+                const colors = estadoColor(trabajo.estado, trabajo.programador);
 
                 return (
                   <button
-                    key={entry.leader.id}
+                    key={entry.groupId || trabajo.id}
                     type="button"
                     onClick={() => {
-                      setSelectedId(entry.leader.id);
+                      setSelectedId(trabajo.id);
                       cerrarDayOverflow();
                     }}
-                    style={styles.overflowSingle}
+                    style={{
+                      ...styles.overflowItem,
+                      background: colors.background,
+                      border: `1px solid ${colors.border}`,
+                      color: colors.color,
+                    }}
                   >
-                    <div style={styles.overflowLeaderPt}>
-                      {entry.leader.pt} · {entry.leader.subestacion || "-"}
+                    <div style={styles.overflowItemPt}>{trabajo.pt || "Sin PT"}</div>
+                    <div style={styles.overflowItemMeta}>
+                      {trabajo.subestacion || "-"} · {trabajo.fecha}
                     </div>
-                    <div style={styles.overflowLeaderComp}>
-                      {truncate(entry.leader.componente || entry.leader.actividad || "-", 80)}
+                    <div style={styles.overflowItemDesc}>
+                      {trabajo.componente || trabajo.actividad || "-"}
                     </div>
                   </button>
                 );
@@ -2697,30 +3529,17 @@ export default function Page() {
   );
 }
 
-function ReadOnlyField({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div style={styles.field}>
-      <label style={styles.label}>{label}</label>
-      <div style={styles.readOnlyBox}>{value || "-"}</div>
-    </div>
-  );
-}
-
 function FormField({
   label,
   children,
+  full = false,
 }: {
   label: string;
   children: React.ReactNode;
+  full?: boolean;
 }) {
   return (
-    <div style={styles.field}>
+    <div style={{ ...styles.field, gridColumn: full ? "1 / -1" : undefined }}>
       <label style={styles.label}>{label}</label>
       {children}
     </div>
@@ -2729,520 +3548,598 @@ function FormField({
 
 const styles: Record<string, React.CSSProperties> = {
   page: {
-    padding: 24,
-    fontFamily: "Arial, sans-serif",
-    background: "#f8fafc",
     minHeight: "100vh",
+    background: "#edf2f8",
+    padding: 20,
     color: "#0f172a",
+    fontFamily: "Arial, sans-serif",
   },
-  header: {
+  headerCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+    marginBottom: 16,
+  },
+  headerTop: {
     display: "flex",
     justifyContent: "space-between",
-    alignItems: "flex-start",
-    gap: 16,
-    marginBottom: 20,
+    gap: 12,
+    flexWrap: "wrap",
+    alignItems: "center",
+  },
+  headerButtons: {
+    display: "flex",
+    gap: 10,
     flexWrap: "wrap",
   },
   title: {
     margin: 0,
-    fontSize: 28,
-    fontWeight: 700,
+    fontSize: 24,
+    fontWeight: 800,
   },
   subtitle: {
-    margin: "6px 0 0 0",
+    marginTop: 8,
     color: "#475569",
-    fontSize: 14,
   },
-  primaryButton: {
-    background: "#2563eb",
-    color: "#fff",
+  primaryBlueButton: {
     border: "none",
-    borderRadius: 10,
-    padding: "12px 18px",
-    fontSize: 14,
-    fontWeight: 700,
+    background: "#2563eb",
+    color: "white",
+    borderRadius: 12,
+    padding: "13px 18px",
+    fontWeight: 800,
+    cursor: "pointer",
+    minWidth: 140,
   },
-  secondaryButton: {
-    background: "#fff",
-    color: "#0f172a",
-    border: "1px solid #cbd5e1",
-    borderRadius: 10,
-    padding: "10px 14px",
-    fontSize: 14,
-    fontWeight: 600,
+  primaryDarkButton: {
+    border: "none",
+    background: "#0f172a",
+    color: "white",
+    borderRadius: 12,
+    padding: "13px 18px",
+    fontWeight: 800,
     cursor: "pointer",
   },
+  secondaryButton: {
+    border: "1px solid #cbd5e1",
+    background: "white",
+    color: "#0f172a",
+    borderRadius: 12,
+    padding: "13px 18px",
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  fileBadge: {
+    display: "inline-flex",
+    alignItems: "center",
+    background: "#e2e8f0",
+    color: "#0f172a",
+    borderRadius: 999,
+    padding: "8px 12px",
+    fontSize: 12,
+    fontWeight: 700,
+  },
   summaryRow: {
-    display: "flex",
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 1fr)",
     gap: 12,
-    flexWrap: "wrap",
     marginBottom: 16,
   },
   summaryCard: {
-    background: "#fff",
-    border: "1px solid #e2e8f0",
-    borderRadius: 12,
-    padding: "12px 16px",
-    minWidth: 140,
+    background: "white",
+    borderRadius: 14,
+    padding: 14,
+    border: "1px solid #dbe5f1",
   },
   summaryLabel: {
-    display: "block",
-    fontSize: 12,
     color: "#64748b",
-    marginBottom: 4,
+    fontSize: 12,
   },
   summaryValue: {
-    fontSize: 22,
+    display: "block",
+    marginTop: 8,
+    fontWeight: 800,
+    fontSize: 32,
   },
-  alertsWrap: {
+  alertsWrapNew: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))",
-    gap: 14,
-    marginBottom: 18,
-  },
-  alertBox: {
-    background: "#fff",
-    border: "1px solid #fde68a",
-    borderRadius: 14,
-    padding: 16,
-    boxShadow: "0 6px 18px rgba(15,23,42,0.04)",
-  },
-  alertBoxEssential: {
-    background: "#fff",
-    border: "1px solid #fecaca",
-    borderRadius: 14,
-    padding: 16,
-    boxShadow: "0 6px 18px rgba(15,23,42,0.04)",
-  },
-  alertHeader: {
-    display: "flex",
-    justifyContent: "space-between",
+    gridTemplateColumns: "1fr 1fr",
     gap: 12,
-    alignItems: "flex-start",
-    marginBottom: 12,
+    marginBottom: 16,
   },
-  alertTitle: {
-    fontSize: 16,
+  alertBoxNew: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    border: "1px solid #f5d46f",
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    position: "relative",
+  },
+  alertBoxEssentialNew: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    border: "1px solid #f3b1b1",
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    position: "relative",
+  },
+  alertCounterAmber: {
+    position: "absolute",
+    top: 12,
+    right: 14,
+    width: 36,
+    height: 36,
+    borderRadius: 999,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
     fontWeight: 800,
-    marginBottom: 4,
+    fontSize: 26,
+    color: "#b45309",
+    background: "#b4530922",
   },
-  alertSubtitle: {
-    fontSize: 12,
+  alertCounterRed: {
+    position: "absolute",
+    top: 12,
+    right: 14,
+    width: 36,
+    height: 36,
+    borderRadius: 999,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontWeight: 800,
+    fontSize: 26,
+    color: "#dc2626",
+    background: "#dc262622",
+  },
+  alertTitleNew: {
+    margin: 0,
+    fontSize: 18,
+    fontWeight: 800,
+  },
+  alertSubtitleNew: {
+    marginTop: 8,
     color: "#64748b",
+    fontSize: 13,
   },
-  alertCount: {
-    minWidth: 42,
-    height: 42,
-    borderRadius: 999,
-    background: "#fef3c7",
-    color: "#92400e",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: 800,
-    fontSize: 18,
-  },
-  alertCountEssential: {
-    minWidth: 42,
-    height: 42,
-    borderRadius: 999,
-    background: "#fee2e2",
-    color: "#b91c1c",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: 800,
-    fontSize: 18,
-  },
-  alertList: {
-    display: "flex",
-    flexDirection: "column",
+  alertListNew: {
+    marginTop: 14,
+    display: "grid",
     gap: 8,
   },
-  alertItemButton: {
-    border: "none",
-    background: "transparent",
-    padding: 0,
-    margin: 0,
+  alertEmptyNew: {
+    border: "1px dashed #cbd5e1",
+    borderRadius: 14,
+    padding: 18,
+    color: "#64748b",
+    background: "#f8fafc",
+  },
+  alertItemButtonNew: {
+    border: "1px solid #dbe5f1",
+    borderRadius: 14,
+    padding: 12,
+    background: "#fff",
     textAlign: "left",
     cursor: "pointer",
   },
-  alertItem: {
-    border: "1px solid #e2e8f0",
-    borderRadius: 10,
-    padding: 10,
-    background: "#f8fafc",
-  },
   alertItemPt: {
-    fontSize: 13,
     fontWeight: 800,
-    marginBottom: 4,
-  },
-  alertItemMeta: {
-    fontSize: 12,
-    color: "#475569",
-    marginBottom: 4,
-  },
-  alertItemDesc: {
-    fontSize: 12,
+    fontSize: 16,
     color: "#0f172a",
   },
-  alertMore: {
-    fontSize: 12,
-    color: "#475569",
-    fontWeight: 700,
-    paddingTop: 2,
-  },
-  alertEmpty: {
+  alertItemMeta: {
+    marginTop: 6,
     fontSize: 13,
-    color: "#64748b",
-    paddingTop: 6,
+    color: "#475569",
   },
-  filtersBox: {
-    background: "#fff",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
+  alertItemDesc: {
+    marginTop: 8,
+    fontSize: 13,
+    color: "#0f172a",
+  },
+  filtersCard: {
+    background: "white",
+    borderRadius: 18,
     padding: 16,
-    marginBottom: 18,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+    marginBottom: 16,
   },
   filtersGridSimple: {
     display: "grid",
     gridTemplateColumns: "1fr",
-    gap: 14,
+    gap: 12,
   },
   field: {
-    display: "flex",
-    flexDirection: "column",
+    display: "grid",
     gap: 6,
   },
   label: {
-    fontSize: 13,
-    fontWeight: 700,
-    color: "#334155",
+    display: "block",
+    marginBottom: 6,
+    fontWeight: 800,
+    color: "#0f172a",
   },
   input: {
-    height: 42,
-    borderRadius: 10,
-    border: "1px solid #cbd5e1",
-    padding: "0 12px",
-    fontSize: 14,
-    outline: "none",
-    background: "#fff",
     width: "100%",
+    borderRadius: 12,
+    border: "1px solid #cbd5e1",
+    padding: "12px 14px",
+    fontSize: 15,
+    outline: "none",
+    background: "white",
     boxSizing: "border-box",
   },
-  textarea: {
-    minHeight: 96,
-    borderRadius: 10,
-    border: "1px solid #cbd5e1",
-    padding: 12,
-    fontSize: 14,
-    outline: "none",
-    background: "#fff",
+  inputReadonly: {
     width: "100%",
-    boxSizing: "border-box",
-    resize: "vertical",
-    fontFamily: "Arial, sans-serif",
-  },
-  readOnlyBox: {
-    minHeight: 42,
-    borderRadius: 10,
+    borderRadius: 12,
     border: "1px solid #cbd5e1",
-    padding: "10px 12px",
-    fontSize: 14,
+    padding: "12px 14px",
+    fontSize: 15,
+    outline: "none",
     background: "#f8fafc",
-    width: "100%",
     boxSizing: "border-box",
-    display: "flex",
-    alignItems: "center",
+    color: "#334155",
   },
   actionsRow: {
     display: "flex",
     justifyContent: "space-between",
     gap: 12,
-    marginTop: 14,
     flexWrap: "wrap",
-    alignItems: "center",
+    marginTop: 14,
   },
   segmented: {
-    display: "inline-flex",
-    border: "1px solid #cbd5e1",
-    borderRadius: 10,
-    overflow: "hidden",
-    background: "#fff",
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
   },
   segmentButton: {
+    border: "1px solid #cbd5e1",
+    background: "white",
+    color: "#0f172a",
+    borderRadius: 12,
     padding: "10px 14px",
-    border: "none",
-    background: "#fff",
-    fontSize: 14,
-    fontWeight: 700,
+    fontWeight: 800,
     cursor: "pointer",
   },
   segmentButtonActive: {
-    background: "#2563eb",
-    color: "#fff",
+    background: "#0f172a",
+    color: "white",
+    borderColor: "#0f172a",
   },
   errorBox: {
-    marginBottom: 16,
-    padding: 12,
-    borderRadius: 10,
     background: "#fff1f2",
-    color: "#b42318",
     border: "1px solid #fecdd3",
+    color: "#b91c1c",
+    padding: 14,
+    borderRadius: 12,
+    fontWeight: 700,
+    marginBottom: 12,
   },
   emptyBox: {
-    background: "#fff",
-    border: "1px solid #e2e8f0",
-    borderRadius: 12,
-    padding: 20,
-  },
-  calendarToolbar: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 12,
-    flexWrap: "wrap",
-    marginBottom: 14,
-  },
-  calendarNav: {
-    display: "flex",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  calendarTitle: {
-    fontSize: 24,
-    fontWeight: 800,
-    textTransform: "capitalize",
-  },
-  calendarWrap: {
-    display: "grid",
-    gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
-    overflow: "hidden",
-    background: "#fff",
-  },
-  weekHeader: {
-    padding: "12px 10px",
-    background: "#f1f5f9",
-    borderBottom: "1px solid #e2e8f0",
-    fontSize: 13,
-    fontWeight: 800,
-    textAlign: "center",
-  },
-  dayCell: {
-    minHeight: 175,
-    borderRight: "1px solid #e2e8f0",
-    borderBottom: "1px solid #e2e8f0",
-    padding: 8,
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    transition: "box-shadow 0.12s ease, border-color 0.12s ease",
-  },
-  dayHeader: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  dayNumberButton: {
-    border: "none",
-    background: "transparent",
-    padding: 0,
-    margin: 0,
-    cursor: "pointer",
-  },
-  dayNumber: {
-    fontSize: 14,
-    fontWeight: 800,
-    borderRadius: 999,
-    padding: "4px 8px",
-  },
-  dayCount: {
-    fontSize: 12,
-    fontWeight: 700,
+    background: "white",
+    borderRadius: 18,
+    padding: 22,
+    border: "1px solid #dbe5f1",
     color: "#475569",
-    background: "#e2e8f0",
-    borderRadius: 999,
-    padding: "2px 8px",
-  },
-  dayItems: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-  },
-  eventCardCompact: {
-    width: "100%",
-    textAlign: "left",
-    borderRadius: 10,
-    padding: "7px 8px",
-    cursor: "grab",
-    fontSize: 12,
-    display: "flex",
-    flexDirection: "column",
-    gap: 2,
-  },
-  eventCompactSub: {
-    fontSize: 11,
-    fontWeight: 800,
-    lineHeight: 1.25,
-    wordBreak: "break-word",
-  },
-  eventCompactPt: {
-    fontSize: 12,
-    fontWeight: 800,
-    lineHeight: 1.25,
-    wordBreak: "break-word",
-  },
-  eventCompactComp: {
-    fontSize: 11,
-    lineHeight: 1.25,
-    wordBreak: "break-word",
-    opacity: 0.95,
-  },
-  moreItemsButton: {
-    fontSize: 12,
-    color: "#64748b",
-    padding: "4px 6px",
-    fontWeight: 700,
-    border: "none",
-    background: "transparent",
-    textAlign: "left",
-    cursor: "pointer",
-  },
-  tableWrap: {
-    background: "#fff",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
-    overflow: "hidden",
-    overflowX: "auto",
-  },
-  table: {
-    width: "100%",
-    borderCollapse: "collapse",
-    minWidth: 900,
-  },
-  tableHeadRow: {
-    background: "#f8fafc",
-  },
-  th: {
-    textAlign: "left",
-    padding: "14px 16px",
-    fontSize: 13,
-    fontWeight: 700,
-    borderBottom: "1px solid #e2e8f0",
-    whiteSpace: "nowrap",
-  },
-  tr: {
-    borderTop: "1px solid #eef2f7",
-  },
-  td: {
-    padding: "13px 16px",
-    fontSize: 13,
-    verticalAlign: "top",
-    lineHeight: 1.4,
-  },
-  estadoChip: {
-    display: "inline-block",
-    padding: "4px 10px",
-    borderRadius: 999,
-    fontSize: 12,
-    fontWeight: 700,
-    whiteSpace: "nowrap",
   },
   emptyInner: {
     padding: 18,
-    fontSize: 14,
     color: "#64748b",
   },
-  modalOverlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(15, 23, 42, 0.45)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 20,
-    zIndex: 1000,
-  },
-  modal: {
-    width: "min(980px, 100%)",
-    maxHeight: "90vh",
-    overflowY: "auto",
-    background: "#fff",
-    borderRadius: 18,
-    border: "1px solid #e2e8f0",
-    boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
-    padding: 20,
-  },
-  modalLarge: {
-    width: "min(1100px, 100%)",
-    maxHeight: "90vh",
-    overflowY: "auto",
-    background: "#fff",
-    borderRadius: 18,
-    border: "1px solid #e2e8f0",
-    boxShadow: "0 20px 60px rgba(15, 23, 42, 0.25)",
-    padding: 20,
-  },
-  modalHeader: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    gap: 12,
+  pmaChartsWrap: {
     marginBottom: 16,
   },
-  modalTitle: {
+  pmaChartCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+  },
+  pmaChartHeader: {
+    marginBottom: 14,
+  },
+  pmaChartTitle: {
     margin: 0,
-    fontSize: 22,
+    fontSize: 24,
     fontWeight: 800,
   },
-  modalSubtitle: {
-    marginTop: 6,
-    color: "#475569",
-    fontSize: 14,
+  pmaChartSubtitle: {
+    marginTop: 8,
+    color: "#64748b",
+    fontSize: 13,
   },
-  closeButton: {
-    border: "1px solid #cbd5e1",
-    background: "#fff",
-    borderRadius: 10,
-    width: 40,
-    height: 40,
-    cursor: "pointer",
-    fontSize: 18,
-    fontWeight: 700,
-  },
-  formGrid: {
+  pmaKpiRow: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gridTemplateColumns: "repeat(6, 1fr)",
+    gap: 10,
+    marginBottom: 18,
+  },
+  pmaKpiCard: {
+    background: "#f8fafc",
+    border: "1px solid #e2e8f0",
+    borderRadius: 14,
+    padding: 12,
+  },
+  pmaKpiLabel: {
+    display: "block",
+    color: "#64748b",
+    fontSize: 12,
+  },
+  pmaKpiValue: {
+    display: "block",
+    marginTop: 6,
+    fontSize: 26,
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  pmaBarsWrap: {
+    display: "grid",
     gap: 12,
   },
-  modalActions: {
-    marginTop: 18,
+  pmaBarRow: {
+    display: "grid",
+    gridTemplateColumns: "140px 1fr 60px",
+    gap: 12,
+    alignItems: "center",
+  },
+  pmaBarLabel: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: "#334155",
+  },
+  pmaBarTrack: {
+    width: "100%",
+    height: 14,
+    borderRadius: 999,
+    background: "#e2e8f0",
+    overflow: "hidden",
+  },
+  pmaBarFill: {
+    height: "100%",
+    borderRadius: 999,
+    background: "#2563eb",
+  },
+  pmaBarValue: {
+    textAlign: "right",
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  programadosWrap: {
+    marginBottom: 16,
+  },
+  programadosCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+  },
+  programadosHeader: {
+    marginBottom: 14,
+  },
+  programadosTitle: {
+    margin: 0,
+    fontSize: 24,
+    fontWeight: 800,
+  },
+  programadosSubtitle: {
+    marginTop: 8,
+    color: "#64748b",
+    fontSize: 13,
+  },
+  programadosKpiRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, 1fr)",
+    gap: 10,
+  },
+  programadosKpiCard: {
+    background: "#f8fafc",
+    border: "1px solid #e2e8f0",
+    borderRadius: 14,
+    padding: 12,
+  },
+  programadosKpiLabel: {
+    display: "block",
+    color: "#64748b",
+    fontSize: 12,
+  },
+  programadosKpiValue: {
+    display: "block",
+    marginTop: 6,
+    fontSize: 26,
+    fontWeight: 800,
+    color: "#0f172a",
+  },
+  calendarToolbarNew: {
     display: "flex",
-    justifyContent: "flex-end",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 12,
+    flexWrap: "wrap",
+    marginBottom: 16,
+  },
+  calendarMainTitle: {
+    margin: 0,
+    fontSize: 32,
+    fontWeight: 800,
+  },
+  calendarMonthLabel: {
+    marginTop: 8,
+    color: "#475569",
+    fontWeight: 700,
+    textTransform: "capitalize",
+  },
+  calendarNav: {
+    display: "flex",
     gap: 10,
     flexWrap: "wrap",
   },
-  toast: {
-    position: "fixed",
-    right: 20,
-    bottom: 20,
-    background: "#16a34a",
-    color: "#fff",
-    padding: "12px 16px",
-    borderRadius: 12,
-    fontSize: 14,
-    fontWeight: 700,
-    boxShadow: "0 10px 30px rgba(22, 163, 74, 0.35)",
-    zIndex: 1200,
+  calendarWrapNew: {
+    display: "grid",
+    gridTemplateColumns: "repeat(7, 1fr)",
+    gap: 12,
   },
-  groupCard: {
-    borderRadius: 10,
-    padding: 8,
+  weekHeaderBlack: {
+    textAlign: "center",
+    fontWeight: 800,
+    color: "white",
+    background: "#0f172a",
+    borderRadius: 12,
+    padding: "10px 0",
+    boxShadow: "0 4px 12px rgba(15,23,42,0.08)",
+  },
+  dayCellNew: {
+    height: 255,
+    minHeight: 255,
+    maxHeight: 255,
+    borderRadius: 18,
+    padding: 12,
     display: "flex",
     flexDirection: "column",
+    gap: 8,
+    overflow: "hidden",
+  },
+  dayHeaderNew: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 8,
+  },
+  dayHeaderActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  addDayButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 999,
+    border: "1px solid #cbd5e1",
+    background: "white",
+    color: "#0f172a",
+    fontWeight: 800,
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 0,
+  },
+  dayNumberButtonNew: {
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    cursor: "pointer",
+  },
+  dayNumberNew: {
+    fontWeight: 800,
+    fontSize: 24,
+    borderRadius: 999,
+  },
+  dayCountNew: {
+    minWidth: 24,
+    height: 24,
+    borderRadius: 999,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 12,
+    fontWeight: 800,
+    color: "#2563eb",
+    background: "#eff6ff",
+    border: "1px solid #bfdbfe",
+    padding: "0 7px",
+  },
+  dayBadgesRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  tinyBadgeBlue: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 999,
+    padding: "3px 8px",
+    fontSize: 10,
+    fontWeight: 800,
+    color: "#1d4ed8",
+    background: "#dbeafe",
+    border: "1px solid #bfdbfe",
+  },
+  dayItemsNew: {
+    display: "grid",
+    gap: 6,
+    flex: 1,
+    overflowY: "auto",
+    maxHeight: 150,
+    minHeight: 150,
+    paddingRight: 4,
+  },
+  eventCardCompactNew: {
+    borderRadius: 12,
+    padding: "6px 8px",
+    display: "grid",
+    gap: 3,
+    textAlign: "left",
+    cursor: "pointer",
+  },
+  eventCompactSubNew: {
+    fontSize: 10,
+    fontWeight: 700,
+    color: "#0f172a",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  eventCompactPtNew: {
+    fontWeight: 800,
+    fontSize: 10,
+    lineHeight: 1.2,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  eventCompactCompNew: {
+    fontSize: 10,
+    color: "#475569",
+    lineHeight: 1.25,
+    display: "-webkit-box",
+    WebkitLineClamp: 2 as any,
+    WebkitBoxOrient: "vertical" as any,
+    overflow: "hidden",
+  },
+  dayFooterNew: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+    marginTop: "auto",
+    paddingTop: 4,
+  },
+  dayFooterText: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "#64748b",
+  },
+  moreItemsButtonNew: {
+    border: "none",
+    background: "#eff6ff",
+    color: "#1d4ed8",
+    borderRadius: 10,
+    padding: "6px 10px",
+    fontSize: 11,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  groupCardNew: {
+    borderRadius: 12,
+    padding: 8,
+    display: "grid",
     gap: 6,
   },
   groupHeaderRow: {
@@ -3251,113 +4148,248 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     gap: 8,
   },
-  groupBadge: {
+  groupBadgeNew: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 999,
+    padding: "2px 8px",
     fontSize: 10,
     fontWeight: 800,
-    borderRadius: 999,
-    background: "rgba(15,23,42,0.08)",
+    background: "rgba(255,255,255,0.8)",
     color: "#0f172a",
-    padding: "2px 8px",
-    whiteSpace: "nowrap",
   },
-  groupMembers: {
-    display: "flex",
-    flexDirection: "column",
+  groupMembersNew: {
+    display: "grid",
     gap: 4,
   },
-  groupMemberButton: {
-    border: "1px dashed #cbd5e1",
-    background: "rgba(255,255,255,0.7)",
-    borderRadius: 8,
-    padding: "5px 6px",
+  groupMemberButtonNew: {
     textAlign: "left",
+    border: "1px solid rgba(255,255,255,0.65)",
+    background: "rgba(255,255,255,0.75)",
+    borderRadius: 10,
+    padding: "6px 8px",
     cursor: "pointer",
   },
-  groupMemberPt: {
-    fontSize: 11,
+  groupMemberPtNew: {
     fontWeight: 800,
+    fontSize: 10,
     color: "#0f172a",
   },
-  groupMemberComp: {
+  groupMemberCompNew: {
     fontSize: 10,
     color: "#475569",
     marginTop: 2,
-    lineHeight: 1.2,
   },
-  groupActions: {
+  groupActionsNew: {
     display: "flex",
     justifyContent: "flex-end",
   },
   unlinkButton: {
-    border: "none",
-    background: "transparent",
-    color: "#b42318",
+    border: "1px solid #cbd5e1",
+    background: "white",
+    color: "#0f172a",
+    borderRadius: 10,
+    padding: "6px 10px",
     fontSize: 11,
-    fontWeight: 700,
+    fontWeight: 800,
     cursor: "pointer",
-    padding: 0,
   },
-  overflowList: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
+  tableWrap: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+    overflowX: "auto",
   },
-  overflowGroup: {
-    border: "1px solid #e2e8f0",
-    borderRadius: 12,
-    padding: 10,
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+  },
+  tableHeadRow: {
     background: "#f8fafc",
   },
-  overflowLeader: {
-    width: "100%",
+  th: {
     textAlign: "left",
-    border: "none",
-    background: "#fff",
-    borderRadius: 10,
-    padding: 10,
-    cursor: "pointer",
-  },
-  overflowLeaderPt: {
+    padding: 12,
+    borderBottom: "1px solid #e2e8f0",
     fontSize: 13,
     fontWeight: 800,
+    color: "#334155",
+  },
+  tr: {
+    borderBottom: "1px solid #eef2f7",
+  },
+  td: {
+    padding: 12,
+    fontSize: 13,
     color: "#0f172a",
+    verticalAlign: "top",
   },
-  overflowLeaderComp: {
-    fontSize: 12,
-    color: "#475569",
-    marginTop: 4,
-  },
-  overflowMembers: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-    marginTop: 8,
-    paddingLeft: 10,
-  },
-  overflowMember: {
-    textAlign: "left",
-    border: "1px dashed #cbd5e1",
-    background: "#fff",
-    borderRadius: 10,
-    padding: 8,
-    cursor: "pointer",
-  },
-  overflowMemberPt: {
+  estadoChip: {
+    display: "inline-flex",
+    alignItems: "center",
+    borderRadius: 999,
+    padding: "4px 10px",
     fontSize: 12,
     fontWeight: 800,
-    color: "#0f172a",
   },
-  overflowMemberComp: {
-    fontSize: 11,
-    color: "#475569",
-    marginTop: 3,
+  modalOverlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(15, 23, 42, 0.42)",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+    zIndex: 1000,
   },
-  overflowSingle: {
-    textAlign: "left",
-    border: "1px solid #e2e8f0",
+  modalLarge: {
+    width: "min(980px, 100%)",
+    maxHeight: "90vh",
+    overflow: "auto",
+    background: "white",
+    borderRadius: 22,
+    padding: 22,
+    boxShadow: "0 24px 60px rgba(15, 23, 42, 0.22)",
+    border: "1px solid #dbe5f1",
+  },
+  modalXL: {
+    width: "min(1180px, 100%)",
+    maxHeight: "92vh",
+    overflow: "auto",
+    background: "white",
+    borderRadius: 22,
+    padding: 18,
+    boxShadow: "0 24px 60px rgba(15, 23, 42, 0.22)",
+    border: "1px solid #dbe5f1",
+  },
+  modalSmall: {
+    width: "min(620px, 100%)",
+    maxHeight: "90vh",
+    overflow: "auto",
+    background: "white",
+    borderRadius: 22,
+    padding: 22,
+    boxShadow: "0 24px 60px rgba(15, 23, 42, 0.22)",
+    border: "1px solid #dbe5f1",
+  },
+  modalHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "flex-start",
+    marginBottom: 16,
+  },
+  modalTitle: {
+    margin: 0,
+    fontSize: 20,
+    fontWeight: 800,
+  },
+  modalSubtitle: {
+    marginTop: 6,
+    color: "#64748b",
+    fontSize: 14,
+  },
+  closeButton: {
+    border: "1px solid #cbd5e1",
     background: "#fff",
-    borderRadius: 12,
-    padding: 10,
+    borderRadius: 10,
+    padding: "8px 14px",
     cursor: "pointer",
+    fontWeight: 700,
+  },
+  formGrid: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 12,
+  },
+  detailGrid4: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+    gap: 10,
+    alignItems: "start",
+  },
+  newPtGrid4: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+    gap: 10,
+    alignItems: "start",
+  },
+  newPtGrid3: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: 10,
+    alignItems: "start",
+    marginTop: 10,
+  },
+  detailBlock: {
+    marginTop: 10,
+  },
+  textareaWide: {
+    width: "100%",
+    minHeight: 78,
+    borderRadius: 12,
+    border: "1px solid #cbd5e1",
+    padding: "12px 14px",
+    fontSize: 15,
+    outline: "none",
+    background: "white",
+    boxSizing: "border-box",
+    resize: "vertical",
+  },
+  modalActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 10,
+    flexWrap: "wrap",
+    marginTop: 16,
+  },
+  modalActionsRight: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 10,
+    flexWrap: "wrap",
+    marginTop: 16,
+  },
+  overflowActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    marginBottom: 12,
+  },
+  overflowList: {
+    display: "grid",
+    gap: 10,
+  },
+  overflowItem: {
+    borderRadius: 14,
+    padding: 14,
+    textAlign: "left",
+    cursor: "pointer",
+  },
+  overflowItemPt: {
+    fontWeight: 800,
+    fontSize: 16,
+  },
+  overflowItemMeta: {
+    marginTop: 6,
+    fontSize: 13,
+  },
+  overflowItemDesc: {
+    marginTop: 8,
+    fontSize: 13,
+  },
+  toast: {
+    position: "fixed",
+    right: 20,
+    bottom: 20,
+    background: "#0f172a",
+    color: "white",
+    borderRadius: 12,
+    padding: "12px 16px",
+    fontWeight: 800,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.2)",
+    zIndex: 1200,
   },
 };
