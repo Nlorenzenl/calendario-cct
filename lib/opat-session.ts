@@ -8,6 +8,11 @@ type OpatSessionStore = {
 const sessionFilePath = path.join(process.cwd(), "data", "opat-session.json");
 
 export function readOpatSession(): OpatSessionStore | null {
+  const envCookie = String(process.env.OPAT_COOKIE || "").trim();
+  if (envCookie) {
+    return { cookie: envCookie };
+  }
+
   try {
     if (!fs.existsSync(sessionFilePath)) {
       return null;
@@ -30,7 +35,7 @@ export function getOpatCookieOrThrow() {
 
   if (!session || !session.cookie) {
     throw new Error(
-      "No existe una cookie OPAT válida en data/opat-session.json"
+      "No existe una cookie OPAT válida. Define OPAT_COOKIE o data/opat-session.json"
     );
   }
 
