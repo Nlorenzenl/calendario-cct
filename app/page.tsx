@@ -37,6 +37,7 @@ type OpatTrabajo = {
   gm?: string;
   ultima_modificacion?: string;
   historial?: string;
+  __manual?: boolean;
 };
 
 type TrabajoUI = {
@@ -56,6 +57,7 @@ type TrabajoUI = {
   area: string;
   aviso: string;
   sodi: string;
+  isManual: boolean;
 };
 
 type CalendarDay = {
@@ -161,6 +163,7 @@ type PmaSummary = {
   reprogramados: number;
   anulados: number;
   otros: number;
+  conPt: number;
 };
 
 type ProgramadosSummary = {
@@ -168,12 +171,33 @@ type ProgramadosSummary = {
   enProgramacion: number;
   autorizados: number;
   suspendidos: number;
+  manuales: number;
+};
+
+type OpatHealthState = {
+  status: "unknown" | "ok" | "expired" | "error" | "checking";
+  message: string;
+  lastCheck: string;
+};
+
+type PmaCalendarFilter = "todos" | "en_calendario" | "fuera_calendario";
+
+type PtsDiariosMesItem = {
+  fecha: string;
+  dia: number;
+  total: number;
 };
 
 const LS_ACOPLES_KEY = "cct_acoples_v1";
 const LS_HISTORIAL_KEY = "cct_historial_v1";
+const LS_MANUALES_KEY = "cct_pts_manuales_v1";
+
 const DEFAULT_USUARIO = "Nicolás Lorenzen";
 const DEFAULT_ORIGEN = "APP_CALENDARIO_CCT";
+
+const KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
+
+const PMA_ESPECIALIDADES_BASE = ["EM", "TR", "SSAA", "SSGG", "EM - LLVV"];
 
 const PMA_HEADERS = [
   "id",
@@ -220,6 +244,403 @@ const CHILE_HOLIDAYS_2026 = [
   "2026-12-08",
   "2026-12-25",
 ];
+// ==============================
+// Helpers base
+// ==============================
+
+function formatDateISO(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function parseDateISO(value: string): Date {
+  return new Date(value + "T00:00:00");
+}
+
+function isWeekend(date: Date) {
+  const d = date.getDay();
+  return d === 0 || d === 6;
+}
+
+function isHoliday(iso: string) {
+  return CHILE_HOLIDAYS_2026.includes(iso);
+}
+
+function getMonthDays(year: number, month: number): CalendarDay[] {
+  const first = new Date(year, month, 1);
+  const last = new Date(year, month + 1, 0);
+
+  const start = new Date(first);
+  start.setDate(first.getDate() - first.getDay());
+
+  const end = new Date(last);
+  end.setDate(last.getDate() + (6 - last.getDay()));
+
+  const days: CalendarDay[] = [];
+  const current = new Date(start);
+
+  while (current <= end) {
+    const iso = formatDateISO(current);
+    days.push({
+      date: new Date(current),
+      iso,
+      inMonth: current.getMonth() === month,
+    });
+    current.setDate(current.getDate() + 1);
+  }
+
+  return days;
+}
+
+function normalizeText(value?: string) {
+  return (value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .trim();
+}
+
+function isAssigned(programador?: string) {
+  if (!programador) return false;
+  const v = programador.trim();
+  if (!v) return false;
+  if (v === "-") return false;
+  return true;
+}
+
+function isManualPT(trabajo: TrabajoUI) {
+  return trabajo.isManual === true;
+}
+
+// ==============================
+// LocalStorage helpers
+// ==============================
+
+function loadJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJSON(key: string, value: any) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+// ==============================
+// Conversión OPAT → UI
+// ==============================
+
+function mapOpatToUI(items: OpatTrabajo[]): TrabajoUI[] {
+  return items.map((t, idx) => {
+    const fecha = t.fInicio || "";
+
+    return {
+      id: t.id || `${t.pt}-${idx}`,
+      original: t,
+      fecha,
+      pt: t.pt || "",
+      horaInicio: t.inicio || "",
+      horaFin: t.fin || "",
+      subestacion: t.ssee || "",
+      componente: t.comp || "",
+      actividad: t.desc || "",
+      estado: t.estado || "",
+      tipo: t.tipo || "",
+      observacion: t.obs || "",
+      programador: t.prog || "",
+      area: t.area || "",
+      aviso: t.aviso || "",
+      sodi: t.sodi || "",
+      isManual: t.__manual === true,
+    };
+  });
+}
+
+// ==============================
+// Métricas Programados
+// ==============================
+
+function buildProgramadosSummary(trabajos: TrabajoUI[]): ProgramadosSummary {
+  let enProgramacion = 0;
+  let autorizados = 0;
+  let suspendidos = 0;
+  let manuales = 0;
+
+  trabajos.forEach((t) => {
+    const estado = normalizeText(t.estado);
+
+    if (estado.includes("program")) enProgramacion++;
+    else if (estado.includes("autoriz")) autorizados++;
+    else if (estado.includes("susp")) suspendidos++;
+
+    if (t.isManual) manuales++;
+  });
+
+  return {
+    total: trabajos.length,
+    enProgramacion,
+    autorizados,
+    suspendidos,
+    manuales,
+  };
+}
+// ==============================
+// Métricas PMA
+// ==============================
+
+function pmaHasPT(item: PMAItem) {
+  const value = String(item.pt || "").trim();
+  return value.length > 0 && value !== "-" && value.toLowerCase() !== "sin pt";
+}
+
+function buildPmaSummary(items: PMAItem[]): PmaSummary {
+  let pendientes = 0;
+  let ejecutados = 0;
+  let reprogramados = 0;
+  let anulados = 0;
+  let otros = 0;
+  let conPt = 0;
+
+  items.forEach((item) => {
+    const estado = normalizeText(item.estadoOriginal || item.estadoNormalizado || "");
+
+    if (pmaHasPT(item)) conPt++;
+
+    if (item.reprogramado || estado.includes("reprogram")) {
+      reprogramados++;
+    } else if (estado.includes("ejecut") || estado.includes("realiz")) {
+      ejecutados++;
+    } else if (estado.includes("anul") || estado.includes("cancel")) {
+      anulados++;
+    } else if (estado.includes("pend") || estado.includes("program")) {
+      pendientes++;
+    } else {
+      otros++;
+    }
+  });
+
+  return {
+    total: items.length,
+    pendientes,
+    ejecutados,
+    reprogramados,
+    anulados,
+    otros,
+    conPt,
+  };
+}
+
+function mapPmaToSheetRow(item: PMAItem) {
+  return [
+    item.id,
+    item.ot,
+    item.pt,
+    item.subestacionOriginal,
+    item.subestacionNormalizada,
+    item.textoBreve,
+    item.descripcionActividad,
+    item.descripcion1,
+    item.actividadResumen,
+    item.componenteDetectado,
+    item.componenteTipo,
+    item.especialidad,
+    item.plan,
+    item.fechaBase,
+    item.fechaProgramada,
+    item.fecha1,
+    item.fechaReprogramacionFinal,
+    item.estadoOriginal,
+    item.estadoNormalizado,
+    item.pendiente ? "true" : "false",
+    item.reprogramado ? "true" : "false",
+    item.ptRepetido,
+    item.mesPma,
+    item.mesPmaBarra,
+  ];
+}
+
+function buildPtSet(trabajos: TrabajoUI[]) {
+  const set = new Set<string>();
+
+  trabajos.forEach((t) => {
+    const pt = String(t.pt || "").trim();
+    if (pt) set.add(pt);
+  });
+
+  return set;
+}
+
+function pmaInCalendar(item: PMAItem, ptSet: Set<string>) {
+  const pt = String(item.pt || "").trim();
+  if (!pt) return false;
+
+  const possiblePts = pt
+    .split(/[;,/|]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  if (possiblePts.length === 0) return ptSet.has(pt);
+
+  return possiblePts.some((x) => ptSet.has(x));
+}
+
+// ==============================
+// PTs diarios mensual
+// ==============================
+
+function buildPtsDiariosMes(
+  trabajos: TrabajoUI[],
+  year: number,
+  month: number
+): PtsDiariosMesItem[] {
+  const lastDay = new Date(year, month + 1, 0).getDate();
+
+  const base: PtsDiariosMesItem[] = Array.from({ length: lastDay }, (_, idx) => {
+    const dia = idx + 1;
+    const date = new Date(year, month, dia);
+
+    return {
+      fecha: formatDateISO(date),
+      dia,
+      total: 0,
+    };
+  });
+
+  const index = new Map(base.map((item) => [item.fecha, item]));
+
+  trabajos.forEach((trabajo) => {
+    const item = index.get(trabajo.fecha);
+    if (item) item.total++;
+  });
+
+  return base;
+}
+
+// ==============================
+// Estilos por estado / manual
+// ==============================
+
+function getTrabajoColors(trabajo: TrabajoUI) {
+  if (trabajo.isManual) {
+    return {
+      background: "#fef9c3",
+      border: "#fde68a",
+      color: "#713f12",
+    };
+  }
+
+  const estado = normalizeText(trabajo.estado);
+
+  if (estado.includes("autoriz")) {
+    return {
+      background: "#ecfdf3",
+      border: "#86efac",
+      color: "#166534",
+    };
+  }
+
+  if (estado.includes("susp")) {
+    return {
+      background: "#fef2f2",
+      border: "#fecaca",
+      color: "#991b1b",
+    };
+  }
+
+  if (isAssigned(trabajo.programador)) {
+    return {
+      background: "#dbeafe",
+      border: "#93c5fd",
+      color: "#1e3a8a",
+    };
+  }
+
+  return {
+    background: "#eff6ff",
+    border: "#bfdbfe",
+    color: "#1e3a8a",
+  };
+}
+
+function formatMonthLabel(date: Date) {
+  return date.toLocaleDateString("es-CL", {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function formatDisplayDate(iso: string) {
+  if (!iso) return "-";
+
+  const [y, m, d] = iso.split("-");
+
+  if (!y || !m || !d) return iso;
+
+  return `${d}-${m}-${y}`;
+}
+
+function formatTimestamp(date: Date) {
+  return date.toLocaleString("es-CL");
+}
+// ==============================
+// Formularios base
+// ==============================
+
+function emptyNewPTForm(fecha = ""): NewPTForm {
+  return {
+    pt: "",
+    fecha,
+    horaInicio: "08:00",
+    horaFin: "18:00",
+    subestacion: "",
+    componente: "",
+    actividad: "",
+    observacion: "",
+    estado: "En programación",
+    tipo: "DESCONEXIÓN",
+    programador: "",
+    aviso: "",
+    sodi: "",
+  };
+}
+
+function emptySodiTercerosForm(fecha = ""): SodiTercerosForm {
+  return {
+    fecha,
+    horaInicio: "08:00",
+    horaFin: "18:00",
+    subestacion: "",
+    componente: "",
+    actividad: "",
+    observacion: "",
+    programador: "",
+    aviso: "",
+  };
+}
+
+function buildEditForm(trabajo: TrabajoUI): EditPTForm {
+  return {
+    fecha: trabajo.fecha || "",
+    horaInicio: trabajo.horaInicio || "08:00",
+    horaFin: trabajo.horaFin || "18:00",
+    subestacion: trabajo.subestacion || "",
+    componente: trabajo.componente || "",
+    actividad: trabajo.actividad || "",
+    observacion: trabajo.observacion || "",
+    estado: trabajo.estado || "En programación",
+    tipo: trabajo.tipo || "DESCONEXIÓN",
+    programador: trabajo.programador || "",
+    aviso: trabajo.aviso || "",
+    sodi: trabajo.sodi || "",
+  };
+}
+
+// ==============================
+// CEN / instalaciones esenciales
+// ==============================
 
 const ESSENTIAL_BARRAS = [
   "BA S/E KAPATUR 220KV BP1",
@@ -334,288 +755,6 @@ const COMMON_STOPWORDS = new Set([
   "cto",
 ]);
 
-function truncate(text: string, max = 90) {
-  if (!text) return "-";
-  if (text.length <= max) return text;
-  return text.slice(0, max).trim() + "...";
-}
-
-function truncateSoft(text: string, max = 28) {
-  if (!text) return "-";
-  if (text.length <= max) return text;
-  return text.slice(0, max).trim() + "...";
-}
-
-function normalizeText(value: string) {
-  return (value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[()]/g, " ")
-    .replace(/[\/]/g, " ")
-    .replace(/-/g, " ")
-    .replace(/,/g, " ")
-    .replace(/\./g, " ")
-    .toLowerCase()
-    .trim();
-}
-
-function isAssignedProgramador(programador: string) {
-  const value = String(programador || "").trim();
-  if (!value) return false;
-  if (value === "-") return false;
-  return true;
-}
-
-function compareDateTime(a: TrabajoUI, b: TrabajoUI) {
-  const aKey = `${a.fecha} ${a.horaInicio || "00:00"}`;
-  const bKey = `${b.fecha} ${b.horaInicio || "00:00"}`;
-  return aKey.localeCompare(bKey);
-}
-
-function toLocalDateInputValue(date: Date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
-function parseISODateLocal(iso: string) {
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(y, (m || 1) - 1, d || 1);
-}
-
-function formatMonthLabel(date: Date) {
-  return date.toLocaleDateString("es-CL", {
-    month: "long",
-    year: "numeric",
-  });
-}
-
-function formatTimestamp(date: Date) {
-  return date.toLocaleString("es-CL");
-}
-
-function buildMonthGrid(monthDate: Date): CalendarDay[] {
-  const year = monthDate.getFullYear();
-  const month = monthDate.getMonth();
-
-  const firstDay = new Date(year, month, 1);
-  const lastDay = new Date(year, month + 1, 0);
-
-  const startWeekDay = (firstDay.getDay() + 6) % 7;
-  const daysInMonth = lastDay.getDate();
-
-  const days: CalendarDay[] = [];
-
-  for (let i = startWeekDay; i > 0; i--) {
-    const d = new Date(year, month, 1 - i);
-    days.push({
-      date: d,
-      iso: toLocalDateInputValue(d),
-      inMonth: false,
-    });
-  }
-
-  for (let day = 1; day <= daysInMonth; day++) {
-    const d = new Date(year, month, day);
-    days.push({
-      date: d,
-      iso: toLocalDateInputValue(d),
-      inMonth: true,
-    });
-  }
-
-  while (days.length % 7 !== 0) {
-    const nextIndex = days.length - (startWeekDay + daysInMonth) + 1;
-    const d = new Date(year, month + 1, nextIndex);
-    days.push({
-      date: d,
-      iso: toLocalDateInputValue(d),
-      inMonth: false,
-    });
-  }
-
-  return days;
-}
-
-function estadoColor(estado: string, programador = "") {
-  if (estado === "Autorizado") {
-    return {
-      background: "#edfdf3",
-      color: "#0f8a43",
-      border: "#b7ebc6",
-    };
-  }
-
-  if (estado === "Suspendido") {
-    return {
-      background: "#fff1f1",
-      color: "#b42318",
-      border: "#f3c4c4",
-    };
-  }
-
-  if (isAssignedProgramador(programador)) {
-    return {
-      background: "#dbeafe",
-      color: "#1e3a8a",
-      border: "#93c5fd",
-    };
-  }
-
-  return {
-    background: "#f3f6ff",
-    color: "#334155",
-    border: "#cdd7ff",
-  };
-}
-
-function emptyNewPTForm(fecha = ""): NewPTForm {
-  return {
-    pt: "",
-    fecha,
-    horaInicio: "08:00",
-    horaFin: "18:00",
-    subestacion: "",
-    componente: "",
-    actividad: "",
-    observacion: "",
-    estado: "En programación",
-    tipo: "DESCONEXIÓN",
-    programador: "",
-    aviso: "",
-    sodi: "",
-  };
-}
-
-function emptySodiTercerosForm(fecha = ""): SodiTercerosForm {
-  return {
-    fecha,
-    horaInicio: "08:00",
-    horaFin: "18:00",
-    subestacion: "",
-    componente: "",
-    actividad: "",
-    observacion: "",
-    programador: "",
-    aviso: "",
-  };
-}
-
-function buildEditForm(trabajo: TrabajoUI): EditPTForm {
-  return {
-    fecha: trabajo.fecha,
-    horaInicio: trabajo.horaInicio || "08:00",
-    horaFin: trabajo.horaFin || "18:00",
-    subestacion: trabajo.subestacion || "",
-    componente: trabajo.componente || "",
-    actividad: trabajo.actividad || "",
-    observacion: trabajo.observacion || "",
-    estado: trabajo.estado || "En programación",
-    tipo: trabajo.tipo || "DESCONEXIÓN",
-    programador: trabajo.programador || "",
-    aviso: trabajo.aviso || "",
-    sodi: trabajo.sodi || "",
-  };
-}
-
-function classifyPmaStatus(item: PMAItem): keyof Omit<PmaSummary, "total"> {
-  if (item.reprogramado) return "reprogramados";
-
-  const estado = normalizeText(item.estadoOriginal || "");
-
-  if (
-    estado.includes("ejecut") ||
-    estado.includes("realiz") ||
-    estado.includes("termin")
-  ) {
-    return "ejecutados";
-  }
-
-  if (estado.includes("anul") || estado.includes("cancel")) {
-    return "anulados";
-  }
-
-  if (
-    estado.includes("pend") ||
-    estado.includes("program") ||
-    estado.includes("planific") ||
-    estado.includes("no ejecut")
-  ) {
-    return "pendientes";
-  }
-
-  return "otros";
-}
-
-function buildPmaSummary(items: PMAItem[]): PmaSummary {
-  const summary: PmaSummary = {
-    total: items.length,
-    pendientes: 0,
-    ejecutados: 0,
-    reprogramados: 0,
-    anulados: 0,
-    otros: 0,
-  };
-
-  for (const item of items) {
-    summary[classifyPmaStatus(item)] += 1;
-  }
-
-  return summary;
-}
-
-function buildProgramadosSummary(items: TrabajoUI[]): ProgramadosSummary {
-  let enProgramacion = 0;
-  let autorizados = 0;
-  let suspendidos = 0;
-
-  for (const item of items) {
-    if (item.estado === "Autorizado") {
-      autorizados += 1;
-    } else if (item.estado === "Suspendido") {
-      suspendidos += 1;
-    } else {
-      enProgramacion += 1;
-    }
-  }
-
-  return {
-    total: items.length,
-    enProgramacion,
-    autorizados,
-    suspendidos,
-  };
-}
-
-function mapPmaToSheetRow(item: PMAItem) {
-  return [
-    item.id,
-    item.ot,
-    item.pt,
-    item.subestacionOriginal,
-    item.subestacionNormalizada,
-    item.textoBreve,
-    item.descripcionActividad,
-    item.descripcion1,
-    item.actividadResumen,
-    item.componenteDetectado,
-    item.componenteTipo,
-    item.especialidad,
-    item.plan,
-    item.fechaBase,
-    item.fechaProgramada,
-    item.fecha1,
-    item.fechaReprogramacionFinal,
-    item.estadoOriginal,
-    item.estadoNormalizado,
-    item.pendiente ? "true" : "false",
-    item.reprogramado ? "true" : "false",
-    item.ptRepetido,
-    item.mesPma,
-    item.mesPmaBarra,
-  ];
-}
 function containsCenCorrelativo(value: string) {
   return /\d{8,}/.test(value || "");
 }
@@ -633,14 +772,26 @@ function requiresCenReview(trabajo: TrabajoUI) {
   return true;
 }
 
-function isHoliday(date: Date) {
+function toLocalDateInputValue(date: Date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function parseISODateLocal(iso: string) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+function isHolidayDate(date: Date) {
   return CHILE_HOLIDAYS_2026.includes(toLocalDateInputValue(date));
 }
 
 function isBusinessDay(date: Date) {
   const day = date.getDay();
-  const isWeekend = day === 0 || day === 6;
-  return !isWeekend && !isHoliday(date);
+  const weekend = day === 0 || day === 6;
+  return !weekend && !isHolidayDate(date);
 }
 
 function addDays(date: Date, days: number) {
@@ -655,9 +806,7 @@ function subtractBusinessDays(date: Date, businessDays: number) {
 
   while (remaining > 0) {
     d = addDays(d, -1);
-    if (isBusinessDay(d)) {
-      remaining -= 1;
-    }
+    if (isBusinessDay(d)) remaining -= 1;
   }
 
   return d;
@@ -666,7 +815,6 @@ function subtractBusinessDays(date: Date, businessDays: number) {
 function subtractCalendarDays(date: Date, days: number) {
   return addDays(date, -days);
 }
-
 function startOfDay(date: Date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
@@ -881,7 +1029,10 @@ function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
     if (!requiresCenReview(trabajo)) continue;
 
     const workDate = parseISODateLocal(trabajo.fecha);
-    const lastDay4Business = subtractBusinessDays(workDate, 5);
+
+    const fourthBusinessDayBefore = subtractBusinessDays(workDate, 4);
+    const lastDay4Business = addDays(fourthBusinessDayBefore, -1);
+    
     const lastDay12Calendar = subtractCalendarDays(workDate, 13);
 
     if (sameDate(lastDay4Business, effectiveToday)) {
@@ -913,6 +1064,10 @@ function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
 
   return { normal, essential, effectiveToday };
 }
+
+// ==============================
+// Acoples / historial
+// ==============================
 
 function getLeaderGroupForTrabajo(trabajoId: string, groups: AcopleGroup[]) {
   return groups.find(
@@ -969,40 +1124,6 @@ function groupTrabajosByAcoples(trabajos: TrabajoUI[], groups: AcopleGroup[]) {
   return result;
 }
 
-function loadAcoplesFromStorage(): AcopleGroup[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(LS_ACOPLES_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveAcoplesToStorage(acoples: AcopleGroup[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(LS_ACOPLES_KEY, JSON.stringify(acoples));
-}
-
-function loadHistorialFromStorage(): HistoryItem[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(LS_HISTORIAL_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveHistorialToStorage(historial: HistoryItem[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(LS_HISTORIAL_KEY, JSON.stringify(historial));
-}
-
 function parseHistorialRows(rows: any[][]): HistoryItem[] {
   return rows
     .slice(1)
@@ -1030,7 +1151,8 @@ function parseAcoplesRows(rows: any[][]): AcopleGroup[] {
       leaderId: String(row[1] || ""),
       memberIds: (() => {
         try {
-          return JSON.parse(String(row[2] || "[]"));
+          const parsed = JSON.parse(String(row[2] || "[]"));
+          return Array.isArray(parsed) ? parsed : [];
         } catch {
           return [];
         }
@@ -1038,6 +1160,48 @@ function parseAcoplesRows(rows: any[][]): AcopleGroup[] {
       createdAt: String(row[3] || ""),
     }));
 }
+
+function buildMonthGrid(monthCursor: Date): CalendarDay[] {
+  const year = monthCursor.getFullYear();
+  const month = monthCursor.getMonth();
+
+  const first = new Date(year, month, 1);
+  const last = new Date(year, month + 1, 0);
+
+  const start = new Date(first);
+  const startDay = start.getDay(); // 0 domingo, 1 lunes...
+  const mondayOffset = startDay === 0 ? -6 : 1 - startDay;
+  start.setDate(start.getDate() + mondayOffset);
+
+  const end = new Date(last);
+  const endDay = end.getDay();
+  const sundayOffset = endDay === 0 ? 0 : 7 - endDay;
+  end.setDate(end.getDate() + sundayOffset);
+
+  const days: CalendarDay[] = [];
+  const current = new Date(start);
+
+  while (current <= end) {
+    days.push({
+      date: new Date(current),
+      iso: toLocalDateInputValue(current),
+      inMonth: current.getMonth() === month,
+    });
+
+    current.setDate(current.getDate() + 1);
+  }
+
+  return days;
+}
+
+function truncateSoft(value: string, max = 32) {
+  const text = String(value || "").trim();
+
+  if (text.length <= max) return text;
+
+  return `${text.slice(0, max - 1)}…`;
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1079,6 +1243,8 @@ export default function Page() {
   const [acoples, setAcoples] = useState<AcopleGroup[]>([]);
   const [persistReady, setPersistReady] = useState(false);
 
+  const [manualPtIds, setManualPtIds] = useState<string[]>([]);
+
   const [draggingId, setDraggingId] = useState<string>("");
   const [dropTargetDate, setDropTargetDate] = useState<string>("");
   const [moveReasonOpen, setMoveReasonOpen] = useState(false);
@@ -1106,8 +1272,26 @@ export default function Page() {
   const [pmaError, setPmaError] = useState("");
   const [pmaFileName, setPmaFileName] = useState("");
 
+  const [pmaEspecialidadesSeleccionadas, setPmaEspecialidadesSeleccionadas] =
+    useState<string[]>(PMA_ESPECIALIDADES_BASE);
+
+  const [pmaCalendarFilter, setPmaCalendarFilter] =
+    useState<PmaCalendarFilter>("todos");
+
+  const [opatHealth, setOpatHealth] = useState<OpatHealthState>({
+    status: "unknown",
+    message: "OPAT sin verificar",
+    lastCheck: "",
+  });
+
+  const [renewModalOpen, setRenewModalOpen] = useState(false);
+  const [renewCookieValue, setRenewCookieValue] = useState("");
+  const [renewError, setRenewError] = useState("");
+  const [renewing, setRenewing] = useState(false);
+
   const today = new Date();
   const now = new Date();
+
   const [monthCursor, setMonthCursor] = useState(
     new Date(today.getFullYear(), today.getMonth(), 1)
   );
@@ -1118,13 +1302,154 @@ export default function Page() {
 
   useEffect(() => {
     if (!toast.visible) return;
+
     const timer = setTimeout(() => {
       setToast({ visible: false, message: "" });
     }, 2400);
+
     return () => clearTimeout(timer);
   }, [toast]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const stored = loadJSON<string[]>(LS_MANUALES_KEY, []);
+    setManualPtIds(stored);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    saveJSON(LS_MANUALES_KEY, manualPtIds);
+  }, [manualPtIds]);
+
+  const marcarPtManual = (pt: string) => {
+    const clean = String(pt || "").trim();
+    if (!clean) return;
+
+    setManualPtIds((prev) => {
+      if (prev.includes(clean)) return prev;
+      return [...prev, clean];
+    });
+  };
+
+  const checkOpatHealth = async (silent = true) => {
+    try {
+      if (!silent) {
+        setOpatHealth((prev) => ({
+          ...prev,
+          status: "checking",
+          message: "Verificando OPAT...",
+        }));
+      }
+
+      const res = await fetch("/api/opat/health", {
+        method: "GET",
+        cache: "no-store",
+      });
+
+      const json = await res.json();
+
+      const checkTime = new Date().toLocaleTimeString("es-CL", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+      if (res.ok && json?.success && json?.status === "ok") {
+        setOpatHealth({
+          status: "ok",
+          message: `OPAT OK · ${json?.count ?? "-"} trabajos`,
+          lastCheck: checkTime,
+        });
+
+        return true;
+      }
+
+      if (json?.status === "expired") {
+        setOpatHealth({
+          status: "expired",
+          message: "Sesión OPAT expirada",
+          lastCheck: checkTime,
+        });
+
+        return false;
+      }
+
+      setOpatHealth({
+        status: "error",
+        message: json?.message || "No se pudo verificar OPAT",
+        lastCheck: checkTime,
+      });
+
+      return false;
+    } catch (err) {
+      console.error(err);
+
+      setOpatHealth({
+        status: "error",
+        message: "Error verificando OPAT",
+        lastCheck: new Date().toLocaleTimeString("es-CL", {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      });
+
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    checkOpatHealth(true);
+
+    const timer = window.setInterval(() => {
+      checkOpatHealth(true);
+    }, KEEP_ALIVE_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const renovarSesionOpat = async () => {
+    try {
+      setRenewError("");
+
+      const value = renewCookieValue.trim();
+
+      if (!value) {
+        setRenewError("Debes pegar el PHPSESSID.");
+        return;
+      }
+
+      setRenewing(true);
+
+      const res = await fetch("/api/opat/set-cookie", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          cookie: value,
+        }),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.success) {
+        throw new Error(json?.error || "No se pudo renovar la sesión OPAT.");
+      }
+
+      setRenewCookieValue("");
+      setRenewModalOpen(false);
+
+      await checkOpatHealth(false);
+      mostrarToast("Sesión OPAT renovada");
+    } catch (err: any) {
+      console.error(err);
+      setRenewError(err?.message || "No se pudo renovar la sesión OPAT.");
+    } finally {
+      setRenewing(false);
+    }
+  };
+    useEffect(() => {
     const cargarPersistencia = async () => {
       try {
         const [rawHistorial, rawAcoples] = await Promise.all([
@@ -1139,8 +1464,11 @@ export default function Page() {
           "No se pudo cargar Google Sheet, uso localStorage como respaldo:",
           gsError
         );
-        setAcoples(loadAcoplesFromStorage());
-        setHistorial(loadHistorialFromStorage());
+
+        if (typeof window !== "undefined") {
+          setAcoples(loadJSON<AcopleGroup[]>(LS_ACOPLES_KEY, []));
+          setHistorial(loadJSON<HistoryItem[]>(LS_HISTORIAL_KEY, []));
+        }
       } finally {
         setPersistReady(true);
       }
@@ -1150,13 +1478,13 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    if (!persistReady) return;
-    saveAcoplesToStorage(acoples);
+    if (!persistReady || typeof window === "undefined") return;
+    saveJSON(LS_ACOPLES_KEY, acoples);
   }, [acoples, persistReady]);
 
   useEffect(() => {
-    if (!persistReady) return;
-    saveHistorialToStorage(historial);
+    if (!persistReady || typeof window === "undefined") return;
+    saveJSON(LS_HISTORIAL_KEY, historial);
   }, [historial, persistReady]);
 
   const appendHistorialPersist = async (item: HistoryItem) => {
@@ -1210,22 +1538,51 @@ export default function Page() {
         cache: "no-store",
       });
 
-      if (!res.ok) {
-        throw new Error("No se pudo obtener la agenda desde OPAT");
-      }
-
       const json = await res.json();
+
+      if (!res.ok) {
+        const msg =
+          json?.message ||
+          json?.error ||
+          json?.opatResponse?.mensaje ||
+          "No se pudo obtener la agenda desde OPAT";
+
+        if (String(msg).toLowerCase().includes("expir")) {
+          setOpatHealth({
+            status: "expired",
+            message: "Sesión OPAT expirada",
+            lastCheck: new Date().toLocaleTimeString("es-CL", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          });
+        }
+
+        throw new Error(msg);
+      }
 
       if (!Array.isArray(json)) {
         throw new Error("La respuesta de OPAT no tiene el formato esperado");
       }
 
       setData(json);
+
       const actual = new Date();
       setMonthCursor(new Date(actual.getFullYear(), actual.getMonth(), 1));
-    } catch (err) {
+
+      setOpatHealth({
+        status: "ok",
+        message: `OPAT OK · ${json.length} trabajos`,
+        lastCheck: new Date().toLocaleTimeString("es-CL", {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      });
+
+      mostrarToast("Agenda OPAT cargada");
+    } catch (err: any) {
       console.error(err);
-      setError("Ocurrió un error al cargar los datos desde OPAT");
+      setError(err?.message || "Ocurrió un error al cargar los datos desde OPAT");
       setData([]);
     } finally {
       setLoading(false);
@@ -1238,14 +1595,33 @@ export default function Page() {
       setPmaError("");
 
       const parsed = await parsePMAFile(file);
+
       setPmaData(parsed);
       setPmaFileName(file.name);
 
+      const especialidades = Array.from(
+        new Set(
+          parsed
+            .map((item) => String(item.especialidad || "").trim())
+            .filter(Boolean)
+        )
+      );
+
+      const ordered = PMA_ESPECIALIDADES_BASE.filter((esp) =>
+        especialidades.includes(esp)
+      );
+
+      const extras = especialidades
+        .filter((esp) => !PMA_ESPECIALIDADES_BASE.includes(esp))
+        .sort();
+
+      setPmaEspecialidadesSeleccionadas([...ordered, ...extras]);
+
       await replacePmaPersist(parsed);
       mostrarToast(`PMA cargado: ${parsed.length} registros`);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setPmaError("No se pudo leer o guardar el archivo PMA.");
+      setPmaError(err?.message || "No se pudo leer o guardar el archivo PMA.");
     } finally {
       setPmaLoading(false);
     }
@@ -1254,34 +1630,45 @@ export default function Page() {
   const onPMAFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
     await cargarArchivoPMA(file);
+
     e.target.value = "";
   };
 
   const trabajos = useMemo<TrabajoUI[]>(() => {
     return data
-      .map((item, index) => ({
-        id:
-          item.id?.toString() ||
-          `${item.pt || "sin-pt"}-${item.fInicio || "sin-fecha"}-${index}`,
-        original: item,
-        fecha: item.fInicio || "",
-        pt: item.pt || "",
-        horaInicio: item.inicio || "",
-        horaFin: item.fin || "",
-        subestacion: item.ssee || "",
-        componente: item.comp || "",
-        actividad: item.desc || "",
-        estado: item.estado || "",
-        tipo: item.tipo || "",
-        observacion: item.obs || "",
-        programador: item.prog || "",
-        area: item.area || "",
-        aviso: item.aviso || "",
-        sodi: item.sodi || "",
-      }))
-      .sort(compareDateTime);
-  }, [data]);
+      .map((item, index) => {
+        const pt = String(item.pt || "").trim();
+
+        return {
+          id:
+            item.id?.toString() ||
+            `${item.pt || "sin-pt"}-${item.fInicio || "sin-fecha"}-${index}`,
+          original: item,
+          fecha: item.fInicio || "",
+          pt,
+          horaInicio: item.inicio || "",
+          horaFin: item.fin || "",
+          subestacion: item.ssee || "",
+          componente: item.comp || "",
+          actividad: item.desc || "",
+          estado: item.estado || "",
+          tipo: item.tipo || "",
+          observacion: item.obs || "",
+          programador: item.prog || "",
+          area: item.area || "",
+          aviso: item.aviso || "",
+          sodi: item.sodi || "",
+          isManual: item.__manual === true || manualPtIds.includes(pt),
+        };
+      })
+      .sort((a, b) => {
+        const aKey = `${a.fecha} ${a.horaInicio || "00:00"}`;
+        const bKey = `${b.fecha} ${b.horaInicio || "00:00"}`;
+        return aKey.localeCompare(bKey);
+      });
+  }, [data, manualPtIds]);
 
   const cenAlerts = useMemo(() => {
     return getCenAlertItems(trabajos, now);
@@ -1311,10 +1698,45 @@ export default function Page() {
     });
   }, [trabajos, busqueda]);
 
+  const ptSetAgenda = useMemo(() => buildPtSet(trabajos), [trabajos]);
+
+  const pmaEspecialidadesDisponibles = useMemo(() => {
+    const set = new Set<string>();
+
+    for (const item of pmaData) {
+      const esp = String(item.especialidad || "").trim();
+      if (esp) set.add(esp);
+    }
+
+    const ordered = PMA_ESPECIALIDADES_BASE.filter((esp) => set.has(esp));
+    const extras = Array.from(set)
+      .filter((esp) => !PMA_ESPECIALIDADES_BASE.includes(esp))
+      .sort();
+
+    return [...ordered, ...extras];
+  }, [pmaData]);
+
   const pmaFiltrado = useMemo(() => {
     const q = normalizeText(busqueda);
+    const selectedSet = new Set(pmaEspecialidadesSeleccionadas);
 
     return pmaData.filter((item) => {
+      const especialidad = String(item.especialidad || "").trim();
+
+      if (pmaEspecialidadesDisponibles.length > 0 && !selectedSet.has(especialidad)) {
+        return false;
+      }
+
+      const existsInCalendar = pmaInCalendar(item, ptSetAgenda);
+
+      if (pmaCalendarFilter === "en_calendario" && !existsInCalendar) {
+        return false;
+      }
+
+      if (pmaCalendarFilter === "fuera_calendario" && existsInCalendar) {
+        return false;
+      }
+
       if (!q) return true;
 
       const texto = normalizeText(
@@ -1329,16 +1751,28 @@ export default function Page() {
           item.especialidad,
           item.estadoOriginal,
           item.fechaBase,
+          item.mesPma,
+          item.mesPmaBarra,
         ].join(" ")
       );
 
       return texto.includes(q);
     });
-  }, [pmaData, busqueda]);
+  }, [
+    pmaData,
+    busqueda,
+    pmaEspecialidadesSeleccionadas,
+    pmaEspecialidadesDisponibles,
+    pmaCalendarFilter,
+    ptSetAgenda,
+  ]);
 
-  const pmaSummary = useMemo(() => buildPmaSummary(pmaData), [pmaData]);
+  const pmaSummary = useMemo(() => buildPmaSummary(pmaFiltrado), [pmaFiltrado]);
 
-  const programadosSummary = useMemo(
+  const pmaEnCalendarioCount = useMemo(() => {
+    return pmaFiltrado.filter((item) => pmaInCalendar(item, ptSetAgenda)).length;
+  }, [pmaFiltrado, ptSetAgenda]);
+    const programadosSummary = useMemo(
     () => buildProgramadosSummary(trabajosFiltrados),
     [trabajosFiltrados]
   );
@@ -1360,11 +1794,21 @@ export default function Page() {
 
   const trabajosPorFecha = useMemo(() => {
     const map = new Map<string, TrabajoUI[]>();
+
     for (const t of trabajosFiltrados) {
       if (!t.fecha) continue;
       if (!map.has(t.fecha)) map.set(t.fecha, []);
       map.get(t.fecha)!.push(t);
     }
+
+    for (const [, items] of map.entries()) {
+      items.sort((a, b) => {
+        const aKey = `${a.horaInicio || "00:00"} ${a.pt}`;
+        const bKey = `${b.horaInicio || "00:00"} ${b.pt}`;
+        return aKey.localeCompare(bKey);
+      });
+    }
+
     return map;
   }, [trabajosFiltrados]);
 
@@ -1388,6 +1832,26 @@ export default function Page() {
 
   const diasMes = useMemo(() => buildMonthGrid(monthCursor), [monthCursor]);
 
+  const trabajosMesActual = useMemo(() => {
+    const ym = `${monthCursor.getFullYear()}-${String(
+      monthCursor.getMonth() + 1
+    ).padStart(2, "0")}`;
+
+    return trabajosFiltrados.filter((t) => t.fecha.startsWith(ym));
+  }, [trabajosFiltrados, monthCursor]);
+
+  const ptsDiariosMes = useMemo(() => {
+    return buildPtsDiariosMes(
+      trabajosFiltrados,
+      monthCursor.getFullYear(),
+      monthCursor.getMonth()
+    );
+  }, [trabajosFiltrados, monthCursor]);
+
+  const maxPtsDiariosMes = useMemo(() => {
+    return Math.max(...ptsDiariosMes.map((item) => item.total), 1);
+  }, [ptsDiariosMes]);
+
   const cambiarMes = (delta: number) => {
     setMonthCursor(
       new Date(monthCursor.getFullYear(), monthCursor.getMonth() + delta, 1)
@@ -1397,13 +1861,6 @@ export default function Page() {
   const irHoy = () => {
     setMonthCursor(new Date(today.getFullYear(), today.getMonth(), 1));
   };
-
-  const trabajosMesActual = useMemo(() => {
-    const ym = `${monthCursor.getFullYear()}-${String(
-      monthCursor.getMonth() + 1
-    ).padStart(2, "0")}`;
-    return trabajosFiltrados.filter((t) => t.fecha.startsWith(ym));
-  }, [trabajosFiltrados, monthCursor]);
 
   const limpiarBusqueda = () => {
     setBusqueda("");
@@ -1420,8 +1877,18 @@ export default function Page() {
     setNewPTOpen(true);
   };
 
+  const cerrarNuevoPT = () => {
+    if (saving) return;
+    setNewPTOpen(false);
+    setNewPTError("");
+  };
+
   const abrirDayOverflow = (dateIso: string) => {
     setDayOverflow({ open: true, date: dateIso });
+  };
+
+  const cerrarDayOverflow = () => {
+    setDayOverflow({ open: false, date: "" });
   };
 
   const abrirSodiDesdeNuevoPT = () => {
@@ -1440,7 +1907,8 @@ export default function Page() {
     setNewPTOpen(false);
     setSodiTercerosOpen(true);
   };
-    const cerrarSodiTerceros = () => {
+
+  const cerrarSodiTerceros = () => {
     if (creatingSodiTerceros) return;
     setSodiTercerosOpen(false);
     setSodiTercerosError("");
@@ -1483,17 +1951,54 @@ export default function Page() {
     mostrarToast("Formulario duplicado. Ingresa el nuevo PT");
   };
 
-  const cerrarNuevoPT = () => {
-    if (saving) return;
-    setNewPTOpen(false);
-    setNewPTError("");
-  };
-
   const updateNewPTField = (field: keyof NewPTForm, value: string) => {
     setNewPTForm((prev) => ({ ...prev, [field]: value }));
   };
 
-  const guardarNuevoPT = async () => {
+  const updateEditField = (field: keyof EditPTForm, value: string) => {
+    setEditForm((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
+  const togglePmaEspecialidad = (especialidad: string) => {
+    setPmaEspecialidadesSeleccionadas((prev) => {
+      if (prev.includes(especialidad)) {
+        return prev.filter((item) => item !== especialidad);
+      }
+
+      return [...prev, especialidad];
+    });
+  };
+
+  const seleccionarTodasEspecialidadesPMA = () => {
+    setPmaEspecialidadesSeleccionadas(pmaEspecialidadesDisponibles);
+  };
+
+  const limpiarEspecialidadesPMA = () => {
+    setPmaEspecialidadesSeleccionadas([]);
+  };
+
+  const getDayItems = (dateIso: string) => {
+    return gruposPorFecha.get(dateIso) || [];
+  };
+
+  const irAlTrabajoDesdeAlerta = (item: CenAlertItem) => {
+    const targetDate = parseISODateLocal(item.fecha);
+    setVista("calendario");
+    setMonthCursor(new Date(targetDate.getFullYear(), targetDate.getMonth(), 1));
+
+    const found = trabajos.find(
+      (t) =>
+        t.pt === item.pt &&
+        t.fecha === item.fecha &&
+        (normalizeText(t.subestacion) === normalizeText(item.subestacion) ||
+          normalizeText(t.componente) === normalizeText(item.componente))
+    );
+
+    if (found) {
+      setSelectedId(found.id);
+    }
+  };
+    const guardarNuevoPT = async () => {
     try {
       setNewPTError("");
 
@@ -1509,7 +2014,7 @@ export default function Page() {
 
       setSaving(true);
 
-      const payload = {
+      const payload: OpatTrabajo = {
         pt: newPTForm.pt.trim(),
         area: "",
         tipo: newPTForm.tipo,
@@ -1536,6 +2041,7 @@ export default function Page() {
         sodiPara: "",
         sodiDe: "",
         gm: "[]",
+        __manual: true,
       };
 
       const res = await fetch("/api/opat/create", {
@@ -1549,45 +2055,35 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(json?.error || json?.opatResponse?.mensaje || "No se pudo guardar el PT.");
+        const msg =
+          json?.error ||
+          json?.opatResponse?.mensaje ||
+          "No se pudo guardar el PT.";
+
+        if (String(msg).toLowerCase().includes("expir")) {
+          setOpatHealth({
+            status: "expired",
+            message: "Sesión OPAT expirada",
+            lastCheck: new Date().toLocaleTimeString("es-CL", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          });
+        }
+
+        throw new Error(msg);
       }
 
-      setData((prev) => [
-        {
-          pt: payload.pt,
-          area: payload.area,
-          tipo: payload.tipo,
-          inicio: payload.inicio,
-          fin: payload.fin,
-          ssee: payload.ssee,
-          comp: payload.comp,
-          desc: payload.desc,
-          obs: payload.obs,
-          re: payload.re,
-          prog: payload.prog,
-          aviso: payload.aviso,
-          sodi: payload.sodi,
-          estado: payload.estado,
-          fInicio: payload.fInicio,
-          fFin: payload.fFin,
-          to1: payload.to1,
-          to2: payload.to2,
-          go1: payload.go1,
-          go2: payload.go2,
-          gop: payload.gop,
-          esSodi: payload.esSodi,
-          sodiCorrelativo: payload.sodiCorrelativo,
-          sodiPara: payload.sodiPara,
-          sodiDe: payload.sodiDe,
-          gm: payload.gm,
-        },
-        ...prev,
-      ]);
+      marcarPtManual(payload.pt);
+
+      setData((prev) => [payload, ...prev]);
 
       setNewPTOpen(false);
       setNewPTError("");
       setNewPTForm(emptyNewPTForm());
-      mostrarToast("PT guardado en OPAT");
+
+      mostrarToast("PT manual guardado en OPAT");
+      await checkOpatHealth(true);
     } catch (err: any) {
       console.error(err);
       setNewPTError(err?.message || "No se pudo guardar el PT en OPAT.");
@@ -1645,7 +2141,7 @@ export default function Page() {
 
       const nuevoPt = String(centralityJson.newPtId).trim();
 
-      const opatPayload = {
+      const opatPayload: OpatTrabajo = {
         pt: nuevoPt,
         area: "",
         tipo: "SODI DE TERCEROS",
@@ -1672,6 +2168,7 @@ export default function Page() {
         sodiPara: "",
         sodiDe: "",
         gm: "[]",
+        __manual: true,
       };
 
       const opatRes = await fetch("/api/opat/create", {
@@ -1686,19 +2183,24 @@ export default function Page() {
 
       if (!opatRes.ok || !opatJson?.success) {
         throw new Error(
-          opatJson?.error || opatJson?.opatResponse?.mensaje || "Se creó en Centrality, pero falló OPAT."
+          opatJson?.error ||
+            opatJson?.opatResponse?.mensaje ||
+            "Se creó en Centrality, pero falló OPAT."
         );
       }
 
+      marcarPtManual(nuevoPt);
+
       await cargarOPAT();
+
       setSodiTercerosOpen(false);
       setSodiTercerosForm(emptySodiTercerosForm());
+
       mostrarToast(`SODI TERCERO creado: ${nuevoPt}`);
+      await checkOpatHealth(true);
     } catch (err: any) {
       console.error(err);
-      setSodiTercerosError(
-        err?.message || "No se pudo crear el SODI TERCERO."
-      );
+      setSodiTercerosError(err?.message || "No se pudo crear el SODI TERCERO.");
     } finally {
       setCreatingSodiTerceros(false);
     }
@@ -1721,6 +2223,54 @@ export default function Page() {
     if (acopleTargetId === trabajoId) {
       setAcopleTargetId("");
     }
+  };
+
+  const onDragEndTrabajo = () => {
+    setDraggingId("");
+    setDropTargetDate("");
+    setAcopleTargetId("");
+  };
+
+  const onDragOverDay = (
+    dateIso: string,
+    e: React.DragEvent<HTMLDivElement>
+  ) => {
+    e.preventDefault();
+    if (!draggingId) return;
+    setDropTargetDate(dateIso);
+  };
+
+  const onDropDay = (dateIso: string, e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+
+    if (!draggingId) return;
+
+    const trabajo = trabajos.find((t) => t.id === draggingId);
+
+    if (!trabajo) {
+      setDraggingId("");
+      setDropTargetDate("");
+      return;
+    }
+
+    if (trabajo.fecha === dateIso) {
+      setDraggingId("");
+      setDropTargetDate("");
+      return;
+    }
+
+    setPendingMove({
+      trabajoId: trabajo.id,
+      fromDate: trabajo.fecha,
+      toDate: dateIso,
+    });
+
+    setMoveReason("");
+    setMoveReasonError("");
+    setMoveReasonOpen(true);
+    setDraggingId("");
+    setDropTargetDate("");
+    setAcopleTargetId("");
   };
 
   const onDropSobreTrabajo = async (
@@ -1816,10 +2366,14 @@ export default function Page() {
     setDraggingId("");
     setDropTargetDate("");
     setAcopleTargetId("");
+
     mostrarToast("PTs acoplados en la agenda");
   };
-
-  const desacoplarGrupo = async (groupId: string, leaderPt: string, fecha: string) => {
+    const desacoplarGrupo = async (
+    groupId: string,
+    leaderPt: string,
+    fecha: string
+  ) => {
     setAcoples((prev) => prev.filter((g) => g.id !== groupId));
 
     const historialItem: HistoryItem = {
@@ -1841,52 +2395,6 @@ export default function Page() {
     mostrarToast("Acople eliminado");
   };
 
-  const onDragEndTrabajo = () => {
-    setDraggingId("");
-    setDropTargetDate("");
-    setAcopleTargetId("");
-  };
-
-  const onDragOverDay = (
-    dateIso: string,
-    e: React.DragEvent<HTMLDivElement>
-  ) => {
-    e.preventDefault();
-    if (!draggingId) return;
-    setDropTargetDate(dateIso);
-  };
-
-  const onDropDay = (dateIso: string, e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-
-    if (!draggingId) return;
-
-    const trabajo = trabajos.find((t) => t.id === draggingId);
-    if (!trabajo) {
-      setDraggingId("");
-      setDropTargetDate("");
-      return;
-    }
-
-    if (trabajo.fecha === dateIso) {
-      setDraggingId("");
-      setDropTargetDate("");
-      return;
-    }
-
-    setPendingMove({
-      trabajoId: trabajo.id,
-      fromDate: trabajo.fecha,
-      toDate: dateIso,
-    });
-    setMoveReason("");
-    setMoveReasonError("");
-    setMoveReasonOpen(true);
-    setDraggingId("");
-    setDropTargetDate("");
-    setAcopleTargetId("");
-  };
-
   const cerrarMoveReasonModal = () => {
     if (moving) return;
     setMoveReasonOpen(false);
@@ -1900,12 +2408,14 @@ export default function Page() {
       if (!pendingMove) return;
 
       const motivo = moveReason.trim();
+
       if (!motivo) {
         setMoveReasonError("Debes ingresar el motivo del cambio.");
         return;
       }
 
       const trabajo = trabajos.find((t) => t.id === pendingMove.trabajoId);
+
       if (!trabajo) {
         setMoveReasonError("No se encontró el trabajo a mover.");
         return;
@@ -1933,9 +2443,23 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(
-          json?.error || json?.opatResponse?.mensaje || "No se pudo reprogramar el PT."
-        );
+        const msg =
+          json?.error ||
+          json?.opatResponse?.mensaje ||
+          "No se pudo reprogramar el PT.";
+
+        if (String(msg).toLowerCase().includes("expir")) {
+          setOpatHealth({
+            status: "expired",
+            message: "Sesión OPAT expirada",
+            lastCheck: new Date().toLocaleTimeString("es-CL", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          });
+        }
+
+        throw new Error(msg);
       }
 
       setData((prev) =>
@@ -1976,7 +2500,9 @@ export default function Page() {
       setPendingMove(null);
       setMoveReason("");
       setMoveReasonError("");
+
       mostrarToast("PT reprogramado en OPAT");
+      await checkOpatHealth(true);
     } catch (err: any) {
       console.error(err);
       setMoveReasonError(
@@ -2033,9 +2559,23 @@ export default function Page() {
       const json = await res.json();
 
       if (!res.ok || !json?.success) {
-        throw new Error(
-          json?.error || json?.opatResponse?.mensaje || "No se pudo actualizar el trabajo."
-        );
+        const msg =
+          json?.error ||
+          json?.opatResponse?.mensaje ||
+          "No se pudo actualizar el trabajo.";
+
+        if (String(msg).toLowerCase().includes("expir")) {
+          setOpatHealth({
+            status: "expired",
+            message: "Sesión OPAT expirada",
+            lastCheck: new Date().toLocaleTimeString("es-CL", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          });
+        }
+
+        throw new Error(msg);
       }
 
       setData((prev) =>
@@ -2088,16 +2628,17 @@ export default function Page() {
       }
 
       mostrarToast("Cambios guardados en OPAT");
+
       setSelectedId("");
       setSuspensionReasonOpen(false);
       setSuspensionReason("");
       setSuspensionReasonError("");
       setPendingSuspensionSave(false);
+
+      await checkOpatHealth(true);
     } catch (err: any) {
       console.error(err);
-      setEditError(
-        err?.message || "No se pudo guardar la edición en OPAT."
-      );
+      setEditError(err?.message || "No se pudo guardar la edición en OPAT.");
     } finally {
       setUpdatingDetail(false);
     }
@@ -2112,10 +2653,6 @@ export default function Page() {
     }
 
     await ejecutarGuardadoEdicion(motivo);
-  };
-
-  const updateEditField = (field: keyof EditPTForm, value: string) => {
-    setEditForm((prev) => (prev ? { ...prev, [field]: value } : prev));
   };
 
   const guardarEdicionTrabajo = async () => {
@@ -2135,28 +2672,6 @@ export default function Page() {
     }
 
     await ejecutarGuardadoEdicion();
-  };
-
-  const irAlTrabajoDesdeAlerta = (item: CenAlertItem) => {
-    const targetDate = parseISODateLocal(item.fecha);
-    setVista("calendario");
-    setMonthCursor(new Date(targetDate.getFullYear(), targetDate.getMonth(), 1));
-
-    const found = trabajos.find(
-      (t) =>
-        t.pt === item.pt &&
-        t.fecha === item.fecha &&
-        (normalizeText(t.subestacion) === normalizeText(item.subestacion) ||
-          normalizeText(t.componente) === normalizeText(item.componente))
-    );
-
-    if (found) {
-      setSelectedId(found.id);
-    }
-  };
-
-  const cerrarDayOverflow = () => {
-    setDayOverflow({ open: false, date: "" });
   };
     return (
     <main style={styles.page}>
@@ -2195,6 +2710,31 @@ export default function Page() {
         </div>
       </div>
 
+      <button
+        type="button"
+        onClick={() => setRenewModalOpen(true)}
+        style={{
+          ...styles.opatFloatingButton,
+          ...(opatHealth.status === "ok"
+            ? styles.opatFloatingOk
+            : opatHealth.status === "expired"
+            ? styles.opatFloatingExpired
+            : opatHealth.status === "checking"
+            ? styles.opatFloatingChecking
+            : styles.opatFloatingUnknown),
+        }}
+        title={opatHealth.message}
+      >
+        <span style={styles.opatDot} />
+        {opatHealth.status === "ok"
+          ? "OPAT OK"
+          : opatHealth.status === "expired"
+          ? "Renovar OPAT"
+          : opatHealth.status === "checking"
+          ? "Verificando..."
+          : "OPAT"}
+      </button>
+
       <div style={styles.summaryRow}>
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>Total cargados</span>
@@ -2202,12 +2742,14 @@ export default function Page() {
             {vista === "pma" ? pmaData.length : trabajos.length}
           </strong>
         </div>
+
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>Mostrados</span>
           <strong style={styles.summaryValue}>
             {vista === "pma" ? pmaFiltrado.length : trabajosFiltrados.length}
           </strong>
         </div>
+
         <div style={styles.summaryCard}>
           <span style={styles.summaryLabel}>En mes visible</span>
           <strong style={styles.summaryValue}>
@@ -2223,7 +2765,8 @@ export default function Page() {
 
             <h2 style={styles.alertTitleNew}>Avisos CEN por 4 días hábiles</h2>
             <p style={styles.alertSubtitleNew}>
-              Último día operativo: {toLocalDateInputValue(cenAlerts.effectiveToday)}
+              Último día operativo:{" "}
+              {toLocalDateInputValue(cenAlerts.effectiveToday)}
             </p>
 
             <div style={styles.alertListNew}>
@@ -2244,7 +2787,7 @@ export default function Page() {
                       {item.fecha} · {item.subestacion || "-"}
                     </div>
                     <div style={styles.alertItemDesc}>
-                      {truncate(item.componente || item.actividad || "-", 80)}
+                      {item.componente || item.actividad || "-"}
                     </div>
                   </button>
                 ))
@@ -2255,13 +2798,18 @@ export default function Page() {
           <section style={styles.alertBoxEssentialNew}>
             <div style={styles.alertCounterRed}>{cenAlerts.essential.length}</div>
 
-            <h2 style={styles.alertTitleNew}>Avisos CEN instalaciones esenciales</h2>
-            <p style={styles.alertSubtitleNew}>Regla de 12 días corridos · corte 07:00</p>
+            <h2 style={styles.alertTitleNew}>
+              Avisos CEN instalaciones esenciales
+            </h2>
+            <p style={styles.alertSubtitleNew}>
+              Regla de 12 días corridos · corte 07:00
+            </p>
 
             <div style={styles.alertListNew}>
               {cenAlerts.essential.length === 0 ? (
                 <div style={styles.alertEmptyNew}>
-                  Hoy no hay trabajos esenciales que venzan por la regla de 12 días.
+                  Hoy no hay trabajos esenciales que venzan por la regla de 12
+                  días.
                 </div>
               ) : (
                 cenAlerts.essential.slice(0, 6).map((item) => (
@@ -2276,7 +2824,7 @@ export default function Page() {
                       {item.fecha} · {item.subestacion || "-"}
                     </div>
                     <div style={styles.alertItemDesc}>
-                      {truncate(item.componente || item.actividad || "-", 80)}
+                      {item.componente || item.actividad || "-"}
                     </div>
                   </button>
                 ))
@@ -2311,6 +2859,7 @@ export default function Page() {
             >
               Calendario
             </button>
+
             <button
               onClick={() => setVista("tabla")}
               style={{
@@ -2320,6 +2869,7 @@ export default function Page() {
             >
               Tabla
             </button>
+
             <button
               onClick={() => setVista("historial")}
               style={{
@@ -2329,6 +2879,7 @@ export default function Page() {
             >
               Historial
             </button>
+
             <button
               onClick={() => setVista("pma")}
               style={{
@@ -2340,8 +2891,18 @@ export default function Page() {
             </button>
           </div>
 
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-            {pmaFileName ? <span style={styles.fileBadge}>{pmaFileName}</span> : null}
+          <div
+            style={{
+              display: "flex",
+              gap: 10,
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            {pmaFileName ? (
+              <span style={styles.fileBadge}>{pmaFileName}</span>
+            ) : null}
+
             <button onClick={limpiarBusqueda} style={styles.secondaryButton}>
               Limpiar búsqueda
             </button>
@@ -2357,284 +2918,14 @@ export default function Page() {
           Presiona <strong>Cargar OPAT</strong> para traer la agenda.
         </div>
       )}
-
-      {vista === "pma" && (
-        <>
-          <div style={styles.pmaChartsWrap}>
-            <div style={styles.pmaChartCard}>
-              <div style={styles.pmaChartHeader}>
-                <h2 style={styles.pmaChartTitle}>Avance PMA</h2>
-                <div style={styles.pmaChartSubtitle}>
-                  Resumen según estado del archivo PMA cargado
-                </div>
-              </div>
-
-              <div style={styles.pmaKpiRow}>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Total</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.total}</strong>
-                </div>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Pendientes</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.pendientes}</strong>
-                </div>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Ejecutados</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.ejecutados}</strong>
-                </div>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Reprogramados</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.reprogramados}</strong>
-                </div>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Anulados</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.anulados}</strong>
-                </div>
-                <div style={styles.pmaKpiCard}>
-                  <span style={styles.pmaKpiLabel}>Otros</span>
-                  <strong style={styles.pmaKpiValue}>{pmaSummary.otros}</strong>
-                </div>
-              </div>
-
-              <div style={styles.pmaBarsWrap}>
-                {[
-                  { key: "pendientes", label: "Pendientes", value: pmaSummary.pendientes },
-                  { key: "ejecutados", label: "Ejecutados", value: pmaSummary.ejecutados },
-                  { key: "reprogramados", label: "Reprogramados", value: pmaSummary.reprogramados },
-                  { key: "anulados", label: "Anulados", value: pmaSummary.anulados },
-                  { key: "otros", label: "Otros", value: pmaSummary.otros },
-                ].map((item) => {
-                  const max = Math.max(
-                    pmaSummary.pendientes,
-                    pmaSummary.ejecutados,
-                    pmaSummary.reprogramados,
-                    pmaSummary.anulados,
-                    pmaSummary.otros,
-                    1
-                  );
-                  const widthPct = (item.value / max) * 100;
-
-                  return (
-                    <div key={item.key} style={styles.pmaBarRow}>
-                      <div style={styles.pmaBarLabel}>{item.label}</div>
-                      <div style={styles.pmaBarTrack}>
-                        <div
-                          style={{
-                            ...styles.pmaBarFill,
-                            width: `${widthPct}%`,
-                          }}
-                        />
-                      </div>
-                      <div style={styles.pmaBarValue}>{item.value}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr style={styles.tableHeadRow}>
-                  <th style={styles.th}>OT</th>
-                  <th style={styles.th}>PT</th>
-                  <th style={styles.th}>Subestación</th>
-                  <th style={styles.th}>Componente detectado</th>
-                  <th style={styles.th}>Tipo</th>
-                  <th style={styles.th}>Actividad</th>
-                  <th style={styles.th}>Especialidad</th>
-                  <th style={styles.th}>Fecha base</th>
-                  <th style={styles.th}>Estado</th>
-                  <th style={styles.th}>Reprogramado</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pmaFiltrado.map((item) => (
-                  <tr key={item.id} style={styles.tr}>
-                    <td style={styles.td}>{item.ot || "-"}</td>
-                    <td style={styles.td}>{item.pt || "-"}</td>
-                    <td style={styles.td}>{item.subestacionOriginal || "-"}</td>
-                    <td style={styles.td}>{item.componenteDetectado || "-"}</td>
-                    <td style={styles.td}>{item.componenteTipo || "-"}</td>
-                    <td style={styles.td} title={item.actividadResumen || "-"}>
-                      {truncate(item.actividadResumen, 90)}
-                    </td>
-                    <td style={styles.td}>{item.especialidad || "-"}</td>
-                    <td style={styles.td}>{item.fechaBase || "-"}</td>
-                    <td style={styles.td}>{item.estadoOriginal || "-"}</td>
-                    <td style={styles.td}>{item.reprogramado ? "Sí" : "No"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {pmaFiltrado.length === 0 && (
-              <div style={styles.emptyInner}>
-                {pmaData.length === 0
-                  ? "Carga un archivo PMA CSV para visualizar la tabla."
-                  : "No hay registros PMA que coincidan con la búsqueda."}
-              </div>
-            )}
-          </div>
-        </>
-      )}
-
-      {vista === "tabla" && (
-        <>
-          <div style={styles.programadosWrap}>
-            <div style={styles.programadosCard}>
-              <div style={styles.programadosHeader}>
-                <h2 style={styles.programadosTitle}>Avance Trabajos Programados</h2>
-                <div style={styles.programadosSubtitle}>
-                  Resumen de PTs actualmente visibles en la tabla
-                </div>
-              </div>
-
-              <div style={styles.programadosKpiRow}>
-                <div style={styles.programadosKpiCard}>
-                  <span style={styles.programadosKpiLabel}>Total PTs cargados</span>
-                  <strong style={styles.programadosKpiValue}>{programadosSummary.total}</strong>
-                </div>
-                <div style={styles.programadosKpiCard}>
-                  <span style={styles.programadosKpiLabel}>En programación</span>
-                  <strong style={styles.programadosKpiValue}>
-                    {programadosSummary.enProgramacion}
-                  </strong>
-                </div>
-                <div style={styles.programadosKpiCard}>
-                  <span style={styles.programadosKpiLabel}>Autorizados</span>
-                  <strong style={styles.programadosKpiValue}>
-                    {programadosSummary.autorizados}
-                  </strong>
-                </div>
-                <div style={styles.programadosKpiCard}>
-                  <span style={styles.programadosKpiLabel}>Suspendidos</span>
-                  <strong style={styles.programadosKpiValue}>
-                    {programadosSummary.suspendidos}
-                  </strong>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div style={styles.tableWrap}>
-            <table style={styles.table}>
-              <thead>
-                <tr style={styles.tableHeadRow}>
-                  <th style={styles.th}>Fecha</th>
-                  <th style={styles.th}>PT</th>
-                  <th style={styles.th}>Hora</th>
-                  <th style={styles.th}>Subestación</th>
-                  <th style={styles.th}>Componente</th>
-                  <th style={styles.th}>Actividad</th>
-                  <th style={styles.th}>Programador</th>
-                  <th style={styles.th}>Estado</th>
-                </tr>
-              </thead>
-              <tbody>
-                {trabajosFiltrados.map((trabajo) => (
-                  <tr
-                    key={trabajo.id}
-                    onClick={() => setSelectedId(trabajo.id)}
-                    style={{
-                      ...styles.tr,
-                      cursor: "pointer",
-                      background:
-                        trabajo.estado === "En programación" && isAssignedProgramador(trabajo.programador)
-                          ? "#eff6ff"
-                          : "transparent",
-                    }}
-                  >
-                    <td style={styles.td}>{trabajo.fecha || "-"}</td>
-                    <td style={styles.td}>{trabajo.pt || "-"}</td>
-                    <td style={styles.td}>
-                      {trabajo.horaInicio || "-"}{" "}
-                      {trabajo.horaFin ? `- ${trabajo.horaFin}` : ""}
-                    </td>
-                    <td style={styles.td}>{trabajo.subestacion || "-"}</td>
-                    <td style={styles.td}>{trabajo.componente || "-"}</td>
-                    <td style={styles.td}>{truncate(trabajo.actividad, 85)}</td>
-                    <td style={styles.td}>{trabajo.programador || "-"}</td>
-                    <td style={styles.td}>
-                      <span
-                        style={{
-                          ...styles.estadoChip,
-                          background: estadoColor(trabajo.estado, trabajo.programador).background,
-                          color: estadoColor(trabajo.estado, trabajo.programador).color,
-                          border: `1px solid ${estadoColor(trabajo.estado, trabajo.programador).border}`,
-                        }}
-                      >
-                        {trabajo.estado || "-"}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {trabajosFiltrados.length === 0 && (
-              <div style={styles.emptyInner}>
-                No hay trabajos que coincidan con la búsqueda.
-              </div>
-            )}
-          </div>
-        </>
-      )}
-
-      {vista === "historial" && (
-        <div style={styles.tableWrap}>
-          <table style={styles.table}>
-            <thead>
-              <tr style={styles.tableHeadRow}>
-                <th style={styles.th}>Tipo</th>
-                <th style={styles.th}>PT</th>
-                <th style={styles.th}>Fecha origen</th>
-                <th style={styles.th}>Fecha destino</th>
-                <th style={styles.th}>Motivo</th>
-                <th style={styles.th}>Detalle</th>
-                <th style={styles.th}>Fecha registro</th>
-                <th style={styles.th}>Usuario</th>
-                <th style={styles.th}>Origen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {historial.map((item) => (
-                <tr key={item.id} style={styles.tr}>
-                  <td style={styles.td}>
-                    {item.tipo === "reprogramacion"
-                      ? "Reprogramación"
-                      : item.tipo === "suspension"
-                      ? "Suspensión"
-                      : "Acople"}
-                  </td>
-                  <td style={styles.td}>{item.pt}</td>
-                  <td style={styles.td}>{item.fechaOrigen}</td>
-                  <td style={styles.td}>{item.fechaDestino}</td>
-                  <td style={styles.td}>{item.motivo}</td>
-                  <td style={styles.td}>{item.detalle || "-"}</td>
-                  <td style={styles.td}>{item.timestamp}</td>
-                  <td style={styles.td}>{item.usuario || "-"}</td>
-                  <td style={styles.td}>{item.origen || "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          {historial.length === 0 && (
-            <div style={styles.emptyInner}>
-              Aún no hay cambios históricos registrados.
-            </div>
-          )}
-        </div>
-      )}
-
-      {vista === "calendario" && trabajos.length > 0 && (
+            {vista === "calendario" && trabajos.length > 0 && (
         <>
           <div style={styles.calendarToolbarNew}>
             <div>
               <h2 style={styles.calendarMainTitle}>Calendario operativo</h2>
-              <div style={styles.calendarMonthLabel}>{formatMonthLabel(monthCursor)}</div>
+              <div style={styles.calendarMonthLabel}>
+                {formatMonthLabel(monthCursor)}
+              </div>
             </div>
 
             <div style={styles.calendarNav}>
@@ -2650,6 +2941,59 @@ export default function Page() {
             </div>
           </div>
 
+          <div style={styles.calendarLegend}>
+            <div style={styles.legendItem}>
+              <span
+                style={{
+                  ...styles.legendDot,
+                  background: "#eff6ff",
+                  borderColor: "#bfdbfe",
+                }}
+              />
+              En programación sin asignar
+            </div>
+            <div style={styles.legendItem}>
+              <span
+                style={{
+                  ...styles.legendDot,
+                  background: "#dbeafe",
+                  borderColor: "#93c5fd",
+                }}
+              />
+              En programación asignado
+            </div>
+            <div style={styles.legendItem}>
+              <span
+                style={{
+                  ...styles.legendDot,
+                  background: "#fef9c3",
+                  borderColor: "#fde68a",
+                }}
+              />
+              PT manual
+            </div>
+            <div style={styles.legendItem}>
+              <span
+                style={{
+                  ...styles.legendDot,
+                  background: "#ecfdf3",
+                  borderColor: "#86efac",
+                }}
+              />
+              Autorizado
+            </div>
+            <div style={styles.legendItem}>
+              <span
+                style={{
+                  ...styles.legendDot,
+                  background: "#fef2f2",
+                  borderColor: "#fecaca",
+                }}
+              />
+              Suspendido
+            </div>
+          </div>
+
           <div style={styles.calendarWrapNew}>
             {["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"].map((day) => (
               <div key={day} style={styles.weekHeaderBlack}>
@@ -2658,7 +3002,8 @@ export default function Page() {
             ))}
 
             {diasMes.map((day) => {
-              const groupedItems = gruposPorFecha.get(day.iso) || [];
+              const groupedItems = getDayItems(day.iso);
+              const totalDia = trabajosPorFecha.get(day.iso)?.length || 0;
               const isToday = day.iso === toLocalDateInputValue(today);
               const isDropTarget = dropTargetDate === day.iso && !!draggingId;
 
@@ -2699,7 +3044,11 @@ export default function Page() {
                         style={{
                           ...styles.dayNumberNew,
                           background: isToday ? "#dbeafe" : "transparent",
-                          color: isToday ? "#1d4ed8" : day.inMonth ? "#0f172a" : "#94a3b8",
+                          color: isToday
+                            ? "#1d4ed8"
+                            : day.inMonth
+                            ? "#0f172a"
+                            : "#94a3b8",
                           padding: isToday ? "2px 10px" : 0,
                         }}
                       >
@@ -2720,22 +3069,22 @@ export default function Page() {
                         +
                       </button>
 
-                      {groupedItems.length > 0 && (
-                        <span style={styles.dayCountNew}>{groupedItems.length}</span>
+                      {totalDia > 0 && (
+                        <span style={styles.dayCountNew}>{totalDia}</span>
                       )}
                     </div>
                   </div>
 
-                  {groupedItems.length > 0 ? (
+                  {totalDia > 0 ? (
                     <div style={styles.dayBadgesRow}>
-                      <span style={styles.tinyBadgeBlue}>{groupedItems.length} PT</span>
+                      <span style={styles.tinyBadgeBlue}>{totalDia} PT</span>
                     </div>
                   ) : null}
 
                   <div style={styles.dayItemsNew}>
                     {groupedItems.slice(0, 4).map((entry) => {
                       const trabajo = entry.leader;
-                      const colors = estadoColor(trabajo.estado, trabajo.programador);
+                      const colors = getTrabajoColors(trabajo);
                       const isAcopleTarget = acopleTargetId === trabajo.id;
 
                       if (entry.kind === "group") {
@@ -2791,6 +3140,12 @@ export default function Page() {
                                   28
                                 )}
                               </div>
+
+                              {trabajo.programador ? (
+                                <div style={styles.eventProgramador}>
+                                  {trabajo.programador}
+                                </div>
+                              ) : null}
                             </button>
 
                             <div style={styles.groupMembersNew}>
@@ -2874,15 +3229,21 @@ export default function Page() {
                               28
                             )}
                           </div>
+
+                          {trabajo.programador ? (
+                            <div style={styles.eventProgramador}>
+                              {trabajo.programador}
+                            </div>
+                          ) : null}
                         </button>
                       );
                     })}
                   </div>
 
-                  {groupedItems.length > 0 ? (
+                  {totalDia > 0 ? (
                     <div style={styles.dayFooterNew}>
                       <div style={styles.dayFooterText}>
-                        {groupedItems.length} trabajo(s)
+                        {totalDia} trabajo(s)
                       </div>
 
                       {groupedItems.length > 4 ? (
@@ -2907,6 +3268,436 @@ export default function Page() {
           </div>
         </>
       )}
+            {vista === "tabla" && (
+        <>
+          <div style={styles.programadosWrap}>
+            <div style={styles.programadosCard}>
+              <div style={styles.programadosHeader}>
+                <h2 style={styles.programadosTitle}>Avance Trabajos Programados</h2>
+                <div style={styles.programadosSubtitle}>
+                  Resumen de PTs actualmente visibles en la tabla.
+                </div>
+              </div>
+
+              <div style={styles.programadosKpiRow5}>
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Total PTs cargados</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.total}
+                  </strong>
+                </div>
+
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>En programación</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.enProgramacion}
+                  </strong>
+                </div>
+
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Autorizados</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.autorizados}
+                  </strong>
+                </div>
+
+                <div style={styles.programadosKpiCard}>
+                  <span style={styles.programadosKpiLabel}>Suspendidos</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.suspendidos}
+                  </strong>
+                </div>
+
+                <div style={styles.programadosKpiCardManual}>
+                  <span style={styles.programadosKpiLabel}>PTs manuales</span>
+                  <strong style={styles.programadosKpiValue}>
+                    {programadosSummary.manuales}
+                  </strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.programadosWrap}>
+            <div style={styles.programadosCard}>
+              <div style={styles.programadosHeader}>
+                <h2 style={styles.programadosTitle}>PTs diarios</h2>
+                <div style={styles.programadosSubtitle}>
+                  Distribución diaria del mes visible: {formatMonthLabel(monthCursor)}.
+                </div>
+              </div>
+
+              <div style={styles.monthBarsWrap}>
+                {ptsDiariosMes.map((item) => {
+                  const heightPct = item.total === 0 ? 0 : Math.max(8, (item.total / maxPtsDiariosMes) * 100);
+
+                  return (
+                    <div key={item.fecha} style={styles.monthBarItem}>
+                      <div style={styles.monthBarValue}>
+                        {item.total > 0 ? item.total : ""}
+                      </div>
+
+                      <div style={styles.monthBarTrack}>
+                        <div
+                          title={`Día ${item.dia}: ${item.total} PT`}
+                          style={{
+                            ...styles.monthBarFill,
+                            height: `${heightPct}%`,
+                            opacity: item.total === 0 ? 0.18 : 1,
+                          }}
+                        />
+                      </div>
+
+                      <div style={styles.monthBarDay}>{item.dia}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr style={styles.tableHeadRow}>
+                  <th style={styles.th}>Fecha</th>
+                  <th style={styles.th}>PT</th>
+                  <th style={styles.th}>Hora</th>
+                  <th style={styles.th}>Subestación</th>
+                  <th style={styles.th}>Componente</th>
+                  <th style={styles.th}>Actividad</th>
+                  <th style={styles.th}>Programador</th>
+                  <th style={styles.th}>Estado</th>
+                  <th style={styles.th}>Origen</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {trabajosFiltrados.map((trabajo) => {
+                  const colors = getTrabajoColors(trabajo);
+
+                  return (
+                    <tr
+                      key={trabajo.id}
+                      onClick={() => setSelectedId(trabajo.id)}
+                      style={{
+                        ...styles.tr,
+                        cursor: "pointer",
+                        background:
+                          trabajo.isManual
+                            ? "#fffbeb"
+                            : normalizeText(trabajo.estado).includes("program") &&
+                              isAssigned(trabajo.programador)
+                            ? "#eff6ff"
+                            : "transparent",
+                      }}
+                    >
+                      <td style={styles.td}>{trabajo.fecha || "-"}</td>
+                      <td style={styles.td}>{trabajo.pt || "-"}</td>
+                      <td style={styles.td}>
+                        {trabajo.horaInicio || "-"}{" "}
+                        {trabajo.horaFin ? `- ${trabajo.horaFin}` : ""}
+                      </td>
+                      <td style={styles.td}>{trabajo.subestacion || "-"}</td>
+                      <td style={styles.td}>{trabajo.componente || "-"}</td>
+                      <td style={styles.td}>{trabajo.actividad || "-"}</td>
+                      <td style={styles.td}>{trabajo.programador || "-"}</td>
+                      <td style={styles.td}>
+                        <span
+                          style={{
+                            ...styles.estadoChip,
+                            background: colors.background,
+                            color: colors.color,
+                            border: `1px solid ${colors.border}`,
+                          }}
+                        >
+                          {trabajo.estado || "-"}
+                        </span>
+                      </td>
+                      <td style={styles.td}>
+                        {trabajo.isManual ? (
+                          <span style={styles.manualChip}>Manual</span>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            {trabajosFiltrados.length === 0 && (
+              <div style={styles.emptyInner}>
+                No hay trabajos que coincidan con la búsqueda.
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {vista === "historial" && (
+        <div style={styles.tableWrap}>
+          <table style={styles.table}>
+            <thead>
+              <tr style={styles.tableHeadRow}>
+                <th style={styles.th}>Tipo</th>
+                <th style={styles.th}>PT</th>
+                <th style={styles.th}>Fecha origen</th>
+                <th style={styles.th}>Fecha destino</th>
+                <th style={styles.th}>Motivo</th>
+                <th style={styles.th}>Detalle</th>
+                <th style={styles.th}>Fecha registro</th>
+                <th style={styles.th}>Usuario</th>
+                <th style={styles.th}>Origen</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {historial.map((item) => (
+                <tr key={item.id} style={styles.tr}>
+                  <td style={styles.td}>
+                    {item.tipo === "reprogramacion"
+                      ? "Reprogramación"
+                      : item.tipo === "suspension"
+                      ? "Suspensión"
+                      : "Acople"}
+                  </td>
+                  <td style={styles.td}>{item.pt}</td>
+                  <td style={styles.td}>{item.fechaOrigen}</td>
+                  <td style={styles.td}>{item.fechaDestino}</td>
+                  <td style={styles.td}>{item.motivo}</td>
+                  <td style={styles.td}>{item.detalle || "-"}</td>
+                  <td style={styles.td}>{item.timestamp}</td>
+                  <td style={styles.td}>{item.usuario || "-"}</td>
+                  <td style={styles.td}>{item.origen || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {historial.length === 0 && (
+            <div style={styles.emptyInner}>
+              Aún no hay cambios históricos registrados.
+            </div>
+          )}
+        </div>
+      )}
+
+      {vista === "pma" && (
+        <>
+          <div style={styles.pmaChartsWrap}>
+            <div style={styles.pmaChartCard}>
+              <div style={styles.pmaChartHeader}>
+                <h2 style={styles.pmaChartTitle}>Avance PMA</h2>
+                <div style={styles.pmaChartSubtitle}>
+                  Resumen según filtros aplicados.
+                </div>
+              </div>
+
+              <div style={styles.pmaKpiRow}>
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Total filtrado</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.total}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Pendientes</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.pendientes}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Ejecutados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.ejecutados}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Reprogramados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.reprogramados}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Anulados</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.anulados}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>En calendario</span>
+                  <strong style={styles.pmaKpiValue}>{pmaEnCalendarioCount}</strong>
+                </div>
+
+                <div style={styles.pmaKpiCard}>
+                  <span style={styles.pmaKpiLabel}>Con PT</span>
+                  <strong style={styles.pmaKpiValue}>{pmaSummary.conPt}</strong>
+                </div>
+              </div>
+
+              <div style={styles.pmaBarsWrap}>
+                {[
+                  { key: "pendientes", label: "Pendientes", value: pmaSummary.pendientes },
+                  { key: "ejecutados", label: "Ejecutados", value: pmaSummary.ejecutados },
+                  { key: "reprogramados", label: "Reprogramados", value: pmaSummary.reprogramados },
+                  { key: "anulados", label: "Anulados", value: pmaSummary.anulados },
+                  { key: "conPt", label: "Con PT", value: pmaSummary.conPt },
+                  { key: "otros", label: "Otros", value: pmaSummary.otros },
+                ].map((item) => {
+                  const max = Math.max(
+                    pmaSummary.pendientes,
+                    pmaSummary.ejecutados,
+                    pmaSummary.reprogramados,
+                    pmaSummary.anulados,
+                    pmaSummary.conPt,
+                    pmaSummary.otros,
+                    1
+                  );
+
+                  const widthPct = (item.value / max) * 100;
+
+                  return (
+                    <div key={item.key} style={styles.pmaBarRow}>
+                      <div style={styles.pmaBarLabel}>{item.label}</div>
+                      <div style={styles.pmaBarTrack}>
+                        <div
+                          style={{
+                            ...styles.pmaBarFill,
+                            width: `${widthPct}%`,
+                          }}
+                        />
+                      </div>
+                      <div style={styles.pmaBarValue}>{item.value}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+                    <div style={styles.pmaFilterCard}>
+            <div>
+              <h3 style={styles.pmaFilterTitle}>Filtros PMA</h3>
+              <p style={styles.pmaFilterSubtitle}>
+                Filtra rápido por especialidad y por presencia en calendario.
+              </p>
+            </div>
+
+            <div style={styles.pmaFilterActions}>
+              <button
+                type="button"
+                onClick={seleccionarTodasEspecialidadesPMA}
+                style={styles.secondaryButton}
+              >
+                Todas las especialidades
+              </button>
+
+              <button
+                type="button"
+                onClick={limpiarEspecialidadesPMA}
+                style={styles.secondaryButton}
+              >
+                Limpiar especialidades
+              </button>
+
+              <select
+                value={pmaCalendarFilter}
+                onChange={(e) =>
+                  setPmaCalendarFilter(e.target.value as PmaCalendarFilter)
+                }
+                style={styles.inputCompact}
+              >
+                <option value="todos">Todos</option>
+                <option value="en_calendario">Solo en calendario</option>
+                <option value="fuera_calendario">Fuera de calendario</option>
+              </select>
+            </div>
+
+            <div style={styles.pmaSpecialtyGrid}>
+              {pmaEspecialidadesDisponibles.length === 0 ? (
+                <div style={styles.emptyInner}>
+                  Carga un PMA para ver especialidades disponibles.
+                </div>
+              ) : (
+                pmaEspecialidadesDisponibles.map((esp) => {
+                  const checked = pmaEspecialidadesSeleccionadas.includes(esp);
+
+                  return (
+                    <button
+                      key={esp}
+                      type="button"
+                      onClick={() => togglePmaEspecialidad(esp)}
+                      style={{
+                        ...styles.pmaSpecialtyButton,
+                        ...(checked ? styles.pmaSpecialtyButtonActive : {}),
+                      }}
+                    >
+                      {checked ? "✓ " : ""}
+                      {esp}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr style={styles.tableHeadRow}>
+                  <th style={styles.th}>En calendario</th>
+                  <th style={styles.th}>Mes PMA</th>
+                  <th style={styles.th}>OT</th>
+                  <th style={styles.th}>PT</th>
+                  <th style={styles.th}>Subestación</th>
+                  <th style={styles.th}>Componente detectado</th>
+                  <th style={styles.th}>Tipo</th>
+                  <th style={styles.th}>Actividad</th>
+                  <th style={styles.th}>Especialidad</th>
+                  <th style={styles.th}>Fecha base</th>
+                  <th style={styles.th}>Estado</th>
+                  <th style={styles.th}>Reprogramado</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {pmaFiltrado.map((item) => {
+                  const existsInCalendar = pmaInCalendar(item, ptSetAgenda);
+
+                  return (
+                    <tr key={item.id} style={styles.tr}>
+                      <td style={{ ...styles.td, textAlign: "center" }}>
+                        {existsInCalendar ? (
+                          <span style={styles.checkCalendar}>✓</span>
+                        ) : (
+                          ""
+                        )}
+                      </td>
+                      <td style={styles.td}>
+                        {item.mesPma || item.mesPmaBarra || "-"}
+                      </td>
+                      <td style={styles.td}>{item.ot || "-"}</td>
+                      <td style={styles.td}>{item.pt || "-"}</td>
+                      <td style={styles.td}>{item.subestacionOriginal || "-"}</td>
+                      <td style={styles.td}>{item.componenteDetectado || "-"}</td>
+                      <td style={styles.td}>{item.componenteTipo || "-"}</td>
+                      <td style={styles.td}>{item.actividadResumen || "-"}</td>
+                      <td style={styles.td}>{item.especialidad || "-"}</td>
+                      <td style={styles.td}>{item.fechaBase || "-"}</td>
+                      <td style={styles.td}>{item.estadoOriginal || "-"}</td>
+                      <td style={styles.td}>{item.reprogramado ? "Sí" : "No"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            {pmaFiltrado.length === 0 && (
+              <div style={styles.emptyInner}>
+                {pmaData.length === 0
+                  ? "Carga un archivo PMA CSV para visualizar la tabla."
+                  : "No hay registros PMA que coincidan con los filtros."}
+              </div>
+            )}
+          </div>
+        </>
+      )}
 
       {trabajoSeleccionado && editForm && (
         <div style={styles.modalOverlay}>
@@ -2915,7 +3706,8 @@ export default function Page() {
               <div>
                 <h2 style={styles.modalTitle}>Detalle del trabajo</h2>
                 <div style={styles.modalSubtitle}>
-                  {trabajoSeleccionado.subestacion || "-"} · {trabajoSeleccionado.pt || "-"}
+                  {trabajoSeleccionado.subestacion || "-"} ·{" "}
+                  {trabajoSeleccionado.pt || "-"}
                 </div>
               </div>
 
@@ -3076,8 +3868,7 @@ export default function Page() {
           </div>
         </div>
       )}
-
-      {newPTOpen && (
+            {newPTOpen && (
         <div style={styles.modalOverlay}>
           <div style={styles.modalXL} onClick={(e) => e.stopPropagation()}>
             <div style={styles.modalHeader}>
@@ -3095,7 +3886,7 @@ export default function Page() {
 
             {newPTError && <div style={styles.errorBox}>{newPTError}</div>}
 
-            <div style={styles.newPtGrid4}>
+            <div style={styles.detailGrid4}>
               <FormField label="PT">
                 <input
                   value={newPTForm.pt}
@@ -3173,9 +3964,7 @@ export default function Page() {
                   <option value="SODI DE TERCEROS">SODI DE TERCEROS</option>
                 </select>
               </FormField>
-            </div>
 
-            <div style={styles.newPtGrid3}>
               <FormField label="Programador">
                 <input
                   value={newPTForm.programador}
@@ -3256,7 +4045,7 @@ export default function Page() {
               <div>
                 <h2 style={styles.modalTitle}>Crear SODI TERCERO</h2>
                 <div style={styles.modalSubtitle}>
-                  Crea en Centrality y luego lo registra en OPAT
+                  Crea en Centrality y luego lo registra en OPAT.
                 </div>
               </div>
 
@@ -3265,7 +4054,9 @@ export default function Page() {
               </button>
             </div>
 
-            {sodiTercerosError && <div style={styles.errorBox}>{sodiTercerosError}</div>}
+            {sodiTercerosError && (
+              <div style={styles.errorBox}>{sodiTercerosError}</div>
+            )}
 
             <div style={styles.formGrid}>
               <FormField label="Usuario Centrality">
@@ -3289,7 +4080,9 @@ export default function Page() {
                 <input
                   type="date"
                   value={sodiTercerosForm.fecha}
-                  onChange={(e) => updateSodiTercerosField("fecha", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("fecha", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3298,7 +4091,9 @@ export default function Page() {
                 <input
                   type="time"
                   value={sodiTercerosForm.horaInicio}
-                  onChange={(e) => updateSodiTercerosField("horaInicio", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("horaInicio", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3307,7 +4102,9 @@ export default function Page() {
                 <input
                   type="time"
                   value={sodiTercerosForm.horaFin}
-                  onChange={(e) => updateSodiTercerosField("horaFin", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("horaFin", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3315,7 +4112,9 @@ export default function Page() {
               <FormField label="Subestación">
                 <input
                   value={sodiTercerosForm.subestacion}
-                  onChange={(e) => updateSodiTercerosField("subestacion", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("subestacion", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3323,7 +4122,9 @@ export default function Page() {
               <FormField label="Componente">
                 <input
                   value={sodiTercerosForm.componente}
-                  onChange={(e) => updateSodiTercerosField("componente", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("componente", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3331,7 +4132,9 @@ export default function Page() {
               <FormField label="Programador">
                 <input
                   value={sodiTercerosForm.programador}
-                  onChange={(e) => updateSodiTercerosField("programador", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("programador", e.target.value)
+                  }
                   style={styles.input}
                 />
               </FormField>
@@ -3339,29 +4142,39 @@ export default function Page() {
               <FormField label="Aviso">
                 <input
                   value={sodiTercerosForm.aviso}
-                  onChange={(e) => updateSodiTercerosField("aviso", e.target.value)}
+                  onChange={(e) =>
+                    updateSodiTercerosField("aviso", e.target.value)
+                  }
                   style={styles.input}
-                />
-              </FormField>
-
-              <FormField label="Actividad" full>
-                <textarea
-                  value={sodiTercerosForm.actividad}
-                  onChange={(e) => updateSodiTercerosField("actividad", e.target.value)}
-                  style={{ ...styles.input, minHeight: 84, resize: "vertical" }}
-                />
-              </FormField>
-
-              <FormField label="Observación" full>
-                <textarea
-                  value={sodiTercerosForm.observacion}
-                  onChange={(e) => updateSodiTercerosField("observacion", e.target.value)}
-                  style={{ ...styles.input, minHeight: 84, resize: "vertical" }}
                 />
               </FormField>
             </div>
 
-            <div style={styles.modalActions}>
+            <div style={styles.detailBlock}>
+              <FormField label="Actividad">
+                <textarea
+                  value={sodiTercerosForm.actividad}
+                  onChange={(e) =>
+                    updateSodiTercerosField("actividad", e.target.value)
+                  }
+                  style={styles.textareaWide}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.detailBlock}>
+              <FormField label="Observación">
+                <textarea
+                  value={sodiTercerosForm.observacion}
+                  onChange={(e) =>
+                    updateSodiTercerosField("observacion", e.target.value)
+                  }
+                  style={styles.textareaWide}
+                />
+              </FormField>
+            </div>
+
+            <div style={styles.modalActionsRight}>
               <button onClick={cerrarSodiTerceros} style={styles.secondaryButton}>
                 Cancelar
               </button>
@@ -3399,11 +4212,11 @@ export default function Page() {
             <textarea
               value={moveReason}
               onChange={(e) => setMoveReason(e.target.value)}
-              style={{ ...styles.input, minHeight: 120, resize: "vertical" }}
+              style={styles.textareaWide}
               placeholder="Escribe el motivo del cambio..."
             />
 
-            <div style={styles.modalActions}>
+            <div style={styles.modalActionsRight}>
               <button onClick={cerrarMoveReasonModal} style={styles.secondaryButton}>
                 Cancelar
               </button>
@@ -3430,24 +4243,33 @@ export default function Page() {
                 <h2 style={styles.modalTitle}>Motivo de suspensión</h2>
               </div>
 
-              <button onClick={cerrarSuspensionReasonModal} style={styles.closeButton}>
+              <button
+                onClick={cerrarSuspensionReasonModal}
+                style={styles.closeButton}
+              >
                 ✕
               </button>
             </div>
 
-            {suspensionReasonError && <div style={styles.errorBox}>{suspensionReasonError}</div>}
+            {suspensionReasonError && (
+              <div style={styles.errorBox}>{suspensionReasonError}</div>
+            )}
 
             <textarea
               value={suspensionReason}
               onChange={(e) => setSuspensionReason(e.target.value)}
-              style={{ ...styles.input, minHeight: 120, resize: "vertical" }}
+              style={styles.textareaWide}
               placeholder="Escribe el motivo de suspensión..."
             />
 
-            <div style={styles.modalActions}>
-              <button onClick={cerrarSuspensionReasonModal} style={styles.secondaryButton}>
+            <div style={styles.modalActionsRight}>
+              <button
+                onClick={cerrarSuspensionReasonModal}
+                style={styles.secondaryButton}
+              >
                 Cancelar
               </button>
+
               <button
                 onClick={confirmarSuspensionConMotivo}
                 disabled={updatingDetail}
@@ -3492,7 +4314,7 @@ export default function Page() {
             <div style={styles.overflowList}>
               {(gruposPorFecha.get(dayOverflow.date) || []).map((entry) => {
                 const trabajo = entry.leader;
-                const colors = estadoColor(trabajo.estado, trabajo.programador);
+                const colors = getTrabajoColors(trabajo);
 
                 return (
                   <button
@@ -3509,16 +4331,68 @@ export default function Page() {
                       color: colors.color,
                     }}
                   >
-                    <div style={styles.overflowItemPt}>{trabajo.pt || "Sin PT"}</div>
+                    <div style={styles.overflowItemPt}>
+                      {trabajo.pt || "Sin PT"}
+                    </div>
                     <div style={styles.overflowItemMeta}>
                       {trabajo.subestacion || "-"} · {trabajo.fecha}
                     </div>
                     <div style={styles.overflowItemDesc}>
                       {trabajo.componente || trabajo.actividad || "-"}
                     </div>
+                    <div style={styles.overflowItemProgramador}>
+                      Programador: {trabajo.programador || "Sin asignar"}
+                    </div>
                   </button>
                 );
               })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renewModalOpen && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modalSmall} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>Renovar sesión OPAT</h2>
+                <div style={styles.modalSubtitle}>
+                  Puedes pegar solo el valor o completo: PHPSESSID=xxxx
+                </div>
+              </div>
+
+              <button onClick={() => setRenewModalOpen(false)} style={styles.closeButton}>
+                ✕
+              </button>
+            </div>
+
+            {renewError && <div style={styles.errorBox}>{renewError}</div>}
+
+            <FormField label="PHPSESSID">
+              <input
+                value={renewCookieValue}
+                onChange={(e) => setRenewCookieValue(e.target.value)}
+                placeholder="PHPSESSID=..."
+                style={styles.input}
+              />
+            </FormField>
+
+            <div style={styles.modalActionsRight}>
+              <button onClick={() => checkOpatHealth(false)} style={styles.secondaryButton}>
+                Verificar
+              </button>
+
+              <button
+                onClick={renovarSesionOpat}
+                disabled={renewing}
+                style={{
+                  ...styles.primaryBlueButton,
+                  opacity: renewing ? 0.7 : 1,
+                }}
+              >
+                {renewing ? "Renovando..." : "Guardar sesión"}
+              </button>
             </div>
           </div>
         </div>
@@ -3532,14 +4406,12 @@ export default function Page() {
 function FormField({
   label,
   children,
-  full = false,
 }: {
   label: string;
   children: React.ReactNode;
-  full?: boolean;
 }) {
   return (
-    <div style={{ ...styles.field, gridColumn: full ? "1 / -1" : undefined }}>
+    <div style={styles.field}>
       <label style={styles.label}>{label}</label>
       {children}
     </div>
@@ -3569,20 +4441,9 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     alignItems: "center",
   },
-  headerButtons: {
-    display: "flex",
-    gap: 10,
-    flexWrap: "wrap",
-  },
-  title: {
-    margin: 0,
-    fontSize: 24,
-    fontWeight: 800,
-  },
-  subtitle: {
-    marginTop: 8,
-    color: "#475569",
-  },
+  headerButtons: { display: "flex", gap: 10, flexWrap: "wrap" },
+  title: { margin: 0, fontSize: 24, fontWeight: 800 },
+  subtitle: { marginTop: 8, color: "#475569" },
   primaryBlueButton: {
     border: "none",
     background: "#2563eb",
@@ -3603,6 +4464,15 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
   },
   secondaryButton: {
+    border: "1px solid #cbd5e1",
+    background: "white",
+    color: "#0f172a",
+    borderRadius: 12,
+    padding: "13px 18px",
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  inputCompact: {
     border: "1px solid #cbd5e1",
     background: "white",
     color: "#0f172a",
@@ -3633,16 +4503,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 14,
     border: "1px solid #dbe5f1",
   },
-  summaryLabel: {
-    color: "#64748b",
-    fontSize: 12,
-  },
-  summaryValue: {
-    display: "block",
-    marginTop: 8,
-    fontWeight: 800,
-    fontSize: 32,
-  },
+  summaryLabel: { color: "#64748b", fontSize: 12 },
+  summaryValue: { display: "block", marginTop: 8, fontWeight: 800, fontSize: 32 },
   alertsWrapNew: {
     display: "grid",
     gridTemplateColumns: "1fr 1fr",
@@ -3654,7 +4516,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 18,
     padding: 16,
     border: "1px solid #f5d46f",
-    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
     position: "relative",
   },
   alertBoxEssentialNew: {
@@ -3662,7 +4523,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 18,
     padding: 16,
     border: "1px solid #f3b1b1",
-    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
     position: "relative",
   },
   alertCounterAmber: {
@@ -3695,21 +4555,9 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#dc2626",
     background: "#dc262622",
   },
-  alertTitleNew: {
-    margin: 0,
-    fontSize: 18,
-    fontWeight: 800,
-  },
-  alertSubtitleNew: {
-    marginTop: 8,
-    color: "#64748b",
-    fontSize: 13,
-  },
-  alertListNew: {
-    marginTop: 14,
-    display: "grid",
-    gap: 8,
-  },
+  alertTitleNew: { margin: 0, fontSize: 18, fontWeight: 800 },
+  alertSubtitleNew: { marginTop: 8, color: "#64748b", fontSize: 13 },
+  alertListNew: { marginTop: 14, display: "grid", gap: 8 },
   alertEmptyNew: {
     border: "1px dashed #cbd5e1",
     borderRadius: 14,
@@ -3725,21 +4573,9 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "left",
     cursor: "pointer",
   },
-  alertItemPt: {
-    fontWeight: 800,
-    fontSize: 16,
-    color: "#0f172a",
-  },
-  alertItemMeta: {
-    marginTop: 6,
-    fontSize: 13,
-    color: "#475569",
-  },
-  alertItemDesc: {
-    marginTop: 8,
-    fontSize: 13,
-    color: "#0f172a",
-  },
+  alertItemPt: { fontWeight: 800, fontSize: 16, color: "#0f172a" },
+  alertItemMeta: { marginTop: 6, fontSize: 13, color: "#475569" },
+  alertItemDesc: { marginTop: 8, fontSize: 13, color: "#0f172a" },
   filtersCard: {
     background: "white",
     borderRadius: 18,
@@ -3748,21 +4584,9 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #dbe5f1",
     marginBottom: 16,
   },
-  filtersGridSimple: {
-    display: "grid",
-    gridTemplateColumns: "1fr",
-    gap: 12,
-  },
-  field: {
-    display: "grid",
-    gap: 6,
-  },
-  label: {
-    display: "block",
-    marginBottom: 6,
-    fontWeight: 800,
-    color: "#0f172a",
-  },
+  filtersGridSimple: { display: "grid", gridTemplateColumns: "1fr", gap: 12 },
+  field: { display: "grid", gap: 6 },
+  label: { display: "block", marginBottom: 6, fontWeight: 800, color: "#0f172a" },
   input: {
     width: "100%",
     borderRadius: 12,
@@ -3791,11 +4615,7 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     marginTop: 14,
   },
-  segmented: {
-    display: "flex",
-    gap: 8,
-    flexWrap: "wrap",
-  },
+  segmented: { display: "flex", gap: 8, flexWrap: "wrap" },
   segmentButton: {
     border: "1px solid #cbd5e1",
     background: "white",
@@ -3805,11 +4625,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
     cursor: "pointer",
   },
-  segmentButtonActive: {
-    background: "#0f172a",
-    color: "white",
-    borderColor: "#0f172a",
-  },
+  segmentButtonActive: { background: "#0f172a", color: "white", borderColor: "#0f172a" },
   errorBox: {
     background: "#fff1f2",
     border: "1px solid #fecdd3",
@@ -3826,135 +4642,7 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #dbe5f1",
     color: "#475569",
   },
-  emptyInner: {
-    padding: 18,
-    color: "#64748b",
-  },
-  pmaChartsWrap: {
-    marginBottom: 16,
-  },
-  pmaChartCard: {
-    background: "white",
-    borderRadius: 18,
-    padding: 16,
-    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
-    border: "1px solid #dbe5f1",
-  },
-  pmaChartHeader: {
-    marginBottom: 14,
-  },
-  pmaChartTitle: {
-    margin: 0,
-    fontSize: 24,
-    fontWeight: 800,
-  },
-  pmaChartSubtitle: {
-    marginTop: 8,
-    color: "#64748b",
-    fontSize: 13,
-  },
-  pmaKpiRow: {
-    display: "grid",
-    gridTemplateColumns: "repeat(6, 1fr)",
-    gap: 10,
-    marginBottom: 18,
-  },
-  pmaKpiCard: {
-    background: "#f8fafc",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
-    padding: 12,
-  },
-  pmaKpiLabel: {
-    display: "block",
-    color: "#64748b",
-    fontSize: 12,
-  },
-  pmaKpiValue: {
-    display: "block",
-    marginTop: 6,
-    fontSize: 26,
-    fontWeight: 800,
-    color: "#0f172a",
-  },
-  pmaBarsWrap: {
-    display: "grid",
-    gap: 12,
-  },
-  pmaBarRow: {
-    display: "grid",
-    gridTemplateColumns: "140px 1fr 60px",
-    gap: 12,
-    alignItems: "center",
-  },
-  pmaBarLabel: {
-    fontSize: 13,
-    fontWeight: 700,
-    color: "#334155",
-  },
-  pmaBarTrack: {
-    width: "100%",
-    height: 14,
-    borderRadius: 999,
-    background: "#e2e8f0",
-    overflow: "hidden",
-  },
-  pmaBarFill: {
-    height: "100%",
-    borderRadius: 999,
-    background: "#2563eb",
-  },
-  pmaBarValue: {
-    textAlign: "right",
-    fontWeight: 800,
-    color: "#0f172a",
-  },
-  programadosWrap: {
-    marginBottom: 16,
-  },
-  programadosCard: {
-    background: "white",
-    borderRadius: 18,
-    padding: 16,
-    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
-    border: "1px solid #dbe5f1",
-  },
-  programadosHeader: {
-    marginBottom: 14,
-  },
-  programadosTitle: {
-    margin: 0,
-    fontSize: 24,
-    fontWeight: 800,
-  },
-  programadosSubtitle: {
-    marginTop: 8,
-    color: "#64748b",
-    fontSize: 13,
-  },
-  programadosKpiRow: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, 1fr)",
-    gap: 10,
-  },
-  programadosKpiCard: {
-    background: "#f8fafc",
-    border: "1px solid #e2e8f0",
-    borderRadius: 14,
-    padding: 12,
-  },
-  programadosKpiLabel: {
-    display: "block",
-    color: "#64748b",
-    fontSize: 12,
-  },
-  programadosKpiValue: {
-    display: "block",
-    marginTop: 6,
-    fontSize: 26,
-    fontWeight: 800,
-    color: "#0f172a",
-  },
+  emptyInner: { padding: 18, color: "#64748b" },
   calendarToolbarNew: {
     display: "flex",
     justifyContent: "space-between",
@@ -3963,21 +4651,28 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     marginBottom: 16,
   },
-  calendarMainTitle: {
-    margin: 0,
-    fontSize: 32,
-    fontWeight: 800,
-  },
+  calendarMainTitle: { margin: 0, fontSize: 32, fontWeight: 800 },
   calendarMonthLabel: {
     marginTop: 8,
     color: "#475569",
     fontWeight: 700,
     textTransform: "capitalize",
   },
-  calendarNav: {
+  calendarNav: { display: "flex", gap: 10, flexWrap: "wrap" },
+  calendarLegend: { display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 14 },
+  legendItem: {
     display: "flex",
-    gap: 10,
-    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#334155",
+  },
+  legendDot: {
+    width: 16,
+    height: 16,
+    borderRadius: 999,
+    border: "1px solid",
   },
   calendarWrapNew: {
     display: "grid",
@@ -3991,7 +4686,6 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#0f172a",
     borderRadius: 12,
     padding: "10px 0",
-    boxShadow: "0 4px 12px rgba(15,23,42,0.08)",
   },
   dayCellNew: {
     height: 255,
@@ -4004,17 +4698,8 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 8,
     overflow: "hidden",
   },
-  dayHeaderNew: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    gap: 8,
-  },
-  dayHeaderActions: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-  },
+  dayHeaderNew: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 },
+  dayHeaderActions: { display: "flex", alignItems: "center", gap: 6 },
   addDayButton: {
     width: 24,
     height: 24,
@@ -4029,17 +4714,8 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
     padding: 0,
   },
-  dayNumberButtonNew: {
-    border: "none",
-    background: "transparent",
-    padding: 0,
-    cursor: "pointer",
-  },
-  dayNumberNew: {
-    fontWeight: 800,
-    fontSize: 24,
-    borderRadius: 999,
-  },
+  dayNumberButtonNew: { border: "none", background: "transparent", padding: 0, cursor: "pointer" },
+  dayNumberNew: { fontWeight: 800, fontSize: 24, borderRadius: 999 },
   dayCountNew: {
     minWidth: 24,
     height: 24,
@@ -4054,11 +4730,7 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #bfdbfe",
     padding: "0 7px",
   },
-  dayBadgesRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 6,
-  },
+  dayBadgesRow: { display: "flex", flexWrap: "wrap", gap: 6 },
   tinyBadgeBlue: {
     display: "inline-flex",
     alignItems: "center",
@@ -4113,6 +4785,7 @@ const styles: Record<string, React.CSSProperties> = {
     WebkitBoxOrient: "vertical" as any,
     overflow: "hidden",
   },
+  eventProgramador: { fontSize: 10, fontWeight: 800, color: "#1d4ed8" },
   dayFooterNew: {
     display: "flex",
     justifyContent: "space-between",
@@ -4121,11 +4794,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: "auto",
     paddingTop: 4,
   },
-  dayFooterText: {
-    fontSize: 11,
-    fontWeight: 800,
-    color: "#64748b",
-  },
+  dayFooterText: { fontSize: 11, fontWeight: 800, color: "#64748b" },
   moreItemsButtonNew: {
     border: "none",
     background: "#eff6ff",
@@ -4136,18 +4805,8 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
     cursor: "pointer",
   },
-  groupCardNew: {
-    borderRadius: 12,
-    padding: 8,
-    display: "grid",
-    gap: 6,
-  },
-  groupHeaderRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 8,
-  },
+  groupCardNew: { borderRadius: 12, padding: 8, display: "grid", gap: 6 },
+  groupHeaderRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
   groupBadgeNew: {
     display: "inline-flex",
     alignItems: "center",
@@ -4159,10 +4818,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "rgba(255,255,255,0.8)",
     color: "#0f172a",
   },
-  groupMembersNew: {
-    display: "grid",
-    gap: 4,
-  },
+  groupMembersNew: { display: "grid", gap: 4 },
   groupMemberButtonNew: {
     textAlign: "left",
     border: "1px solid rgba(255,255,255,0.65)",
@@ -4171,20 +4827,9 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "6px 8px",
     cursor: "pointer",
   },
-  groupMemberPtNew: {
-    fontWeight: 800,
-    fontSize: 10,
-    color: "#0f172a",
-  },
-  groupMemberCompNew: {
-    fontSize: 10,
-    color: "#475569",
-    marginTop: 2,
-  },
-  groupActionsNew: {
-    display: "flex",
-    justifyContent: "flex-end",
-  },
+  groupMemberPtNew: { fontWeight: 800, fontSize: 10, color: "#0f172a" },
+  groupMemberCompNew: { fontSize: 10, color: "#475569", marginTop: 2 },
+  groupActionsNew: { display: "flex", justifyContent: "flex-end" },
   unlinkButton: {
     border: "1px solid #cbd5e1",
     background: "white",
@@ -4195,6 +4840,79 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
     cursor: "pointer",
   },
+  programadosWrap: { marginBottom: 16 },
+  programadosCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+  },
+  programadosHeader: { marginBottom: 14 },
+  programadosTitle: { margin: 0, fontSize: 24, fontWeight: 800 },
+  programadosSubtitle: { marginTop: 8, color: "#64748b", fontSize: 13 },
+  programadosKpiRow5: {
+    display: "grid",
+    gridTemplateColumns: "repeat(5, 1fr)",
+    gap: 10,
+  },
+  programadosKpiCard: {
+    background: "#f8fafc",
+    border: "1px solid #e2e8f0",
+    borderRadius: 14,
+    padding: 12,
+  },
+  programadosKpiCardManual: {
+    background: "#fffbeb",
+    border: "1px solid #fde68a",
+    borderRadius: 14,
+    padding: 12,
+  },
+  programadosKpiLabel: { display: "block", color: "#64748b", fontSize: 12 },
+  programadosKpiValue: { display: "block", marginTop: 6, fontSize: 26, fontWeight: 800, color: "#0f172a" },
+  monthBarsWrap: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(22px, 1fr))",
+    gap: 8,
+    alignItems: "end",
+    height: 190,
+    paddingTop: 16,
+  },
+  monthBarItem: {
+    height: "100%",
+    display: "grid",
+    gridTemplateRows: "22px 1fr 20px",
+    alignItems: "end",
+    justifyItems: "center",
+    gap: 4,
+  },
+  monthBarValue: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "#0f172a",
+    minHeight: 16,
+  },
+  monthBarTrack: {
+    width: "100%",
+    maxWidth: 24,
+    height: "100%",
+    background: "#e2e8f0",
+    borderRadius: 999,
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "flex-end",
+  },
+  monthBarFill: {
+    width: "100%",
+    background: "#2563eb",
+    borderRadius: 999,
+    minHeight: 2,
+  },
+  monthBarDay: {
+    fontSize: 10,
+    fontWeight: 700,
+    color: "#64748b",
+  },
   tableWrap: {
     background: "white",
     borderRadius: 18,
@@ -4203,13 +4921,8 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #dbe5f1",
     overflowX: "auto",
   },
-  table: {
-    width: "100%",
-    borderCollapse: "collapse",
-  },
-  tableHeadRow: {
-    background: "#f8fafc",
-  },
+  table: { width: "100%", borderCollapse: "collapse" },
+  tableHeadRow: { background: "#f8fafc" },
   th: {
     textAlign: "left",
     padding: 12,
@@ -4218,15 +4931,8 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
     color: "#334155",
   },
-  tr: {
-    borderBottom: "1px solid #eef2f7",
-  },
-  td: {
-    padding: 12,
-    fontSize: 13,
-    color: "#0f172a",
-    verticalAlign: "top",
-  },
+  tr: { borderBottom: "1px solid #eef2f7" },
+  td: { padding: 12, fontSize: 13, color: "#0f172a", verticalAlign: "top" },
   estadoChip: {
     display: "inline-flex",
     alignItems: "center",
@@ -4234,6 +4940,96 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "4px 10px",
     fontSize: 12,
     fontWeight: 800,
+  },
+  manualChip: {
+    display: "inline-flex",
+    alignItems: "center",
+    borderRadius: 999,
+    padding: "4px 10px",
+    fontSize: 12,
+    fontWeight: 800,
+    color: "#713f12",
+    background: "#fef9c3",
+    border: "1px solid #fde68a",
+  },
+  pmaChartsWrap: { marginBottom: 16 },
+  pmaChartCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+  },
+  pmaChartHeader: { marginBottom: 14 },
+  pmaChartTitle: { margin: 0, fontSize: 24, fontWeight: 800 },
+  pmaChartSubtitle: { marginTop: 8, color: "#64748b", fontSize: 13 },
+  pmaKpiRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+    gap: 10,
+    marginBottom: 18,
+  },
+  pmaKpiCard: {
+    background: "#f8fafc",
+    border: "1px solid #e2e8f0",
+    borderRadius: 14,
+    padding: 12,
+  },
+  pmaKpiLabel: { display: "block", color: "#64748b", fontSize: 12 },
+  pmaKpiValue: { display: "block", marginTop: 6, fontSize: 26, fontWeight: 800, color: "#0f172a" },
+  pmaBarsWrap: { display: "grid", gap: 12 },
+  pmaBarRow: {
+    display: "grid",
+    gridTemplateColumns: "140px 1fr 60px",
+    gap: 12,
+    alignItems: "center",
+  },
+  pmaBarLabel: { fontSize: 13, fontWeight: 700, color: "#334155" },
+  pmaBarTrack: {
+    width: "100%",
+    height: 14,
+    borderRadius: 999,
+    background: "#e2e8f0",
+    overflow: "hidden",
+  },
+  pmaBarFill: { height: "100%", borderRadius: 999, background: "#2563eb" },
+  pmaBarValue: { textAlign: "right", fontWeight: 800, color: "#0f172a" },
+  pmaFilterCard: {
+    background: "white",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.06)",
+    border: "1px solid #dbe5f1",
+    marginBottom: 16,
+  },
+  pmaFilterTitle: { margin: 0, fontSize: 18, fontWeight: 800 },
+  pmaFilterSubtitle: { marginTop: 6, color: "#64748b", fontSize: 13 },
+  pmaFilterActions: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 },
+  pmaSpecialtyGrid: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 14 },
+  pmaSpecialtyButton: {
+    border: "1px solid #cbd5e1",
+    borderRadius: 999,
+    padding: "8px 12px",
+    background: "#fff",
+    fontWeight: 800,
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  pmaSpecialtyButtonActive: {
+    background: "#dbeafe",
+    borderColor: "#93c5fd",
+    color: "#1e3a8a",
+  },
+  checkCalendar: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 24,
+    height: 24,
+    borderRadius: 999,
+    background: "#dcfce7",
+    color: "#166534",
+    fontWeight: 900,
   },
   modalOverlay: {
     position: "fixed",
@@ -4282,16 +5078,8 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "flex-start",
     marginBottom: 16,
   },
-  modalTitle: {
-    margin: 0,
-    fontSize: 20,
-    fontWeight: 800,
-  },
-  modalSubtitle: {
-    marginTop: 6,
-    color: "#64748b",
-    fontSize: 14,
-  },
+  modalTitle: { margin: 0, fontSize: 20, fontWeight: 800 },
+  modalSubtitle: { marginTop: 6, color: "#64748b", fontSize: 14 },
   closeButton: {
     border: "1px solid #cbd5e1",
     background: "#fff",
@@ -4311,25 +5099,10 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 10,
     alignItems: "start",
   },
-  newPtGrid4: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: 10,
-    alignItems: "start",
-  },
-  newPtGrid3: {
-    display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: 10,
-    alignItems: "start",
-    marginTop: 10,
-  },
-  detailBlock: {
-    marginTop: 10,
-  },
+  detailBlock: { marginTop: 10 },
   textareaWide: {
     width: "100%",
-    minHeight: 78,
+    minHeight: 90,
     borderRadius: 12,
     border: "1px solid #cbd5e1",
     padding: "12px 14px",
@@ -4339,13 +5112,6 @@ const styles: Record<string, React.CSSProperties> = {
     boxSizing: "border-box",
     resize: "vertical",
   },
-  modalActions: {
-    display: "flex",
-    justifyContent: "flex-end",
-    gap: 10,
-    flexWrap: "wrap",
-    marginTop: 16,
-  },
   modalActionsRight: {
     display: "flex",
     justifyContent: "flex-end",
@@ -4353,33 +5119,34 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     marginTop: 16,
   },
-  overflowActions: {
-    display: "flex",
-    justifyContent: "flex-end",
-    marginBottom: 12,
-  },
-  overflowList: {
-    display: "grid",
-    gap: 10,
-  },
-  overflowItem: {
-    borderRadius: 14,
-    padding: 14,
-    textAlign: "left",
-    cursor: "pointer",
-  },
-  overflowItemPt: {
+  overflowActions: { display: "flex", justifyContent: "flex-end", marginBottom: 12 },
+  overflowList: { display: "grid", gap: 10 },
+  overflowItem: { borderRadius: 14, padding: 14, textAlign: "left", cursor: "pointer" },
+  overflowItemPt: { fontWeight: 800, fontSize: 16 },
+  overflowItemMeta: { marginTop: 6, fontSize: 13 },
+  overflowItemDesc: { marginTop: 8, fontSize: 13 },
+  overflowItemProgramador: { marginTop: 8, fontSize: 12, fontWeight: 800 },
+  opatFloatingButton: {
+    position: "fixed",
+    left: 18,
+    bottom: 18,
+    zIndex: 900,
+    border: "1px solid #cbd5e1",
+    borderRadius: 999,
+    padding: "9px 13px",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 12,
     fontWeight: 800,
-    fontSize: 16,
+    cursor: "pointer",
+    boxShadow: "0 8px 22px rgba(15,23,42,0.14)",
   },
-  overflowItemMeta: {
-    marginTop: 6,
-    fontSize: 13,
-  },
-  overflowItemDesc: {
-    marginTop: 8,
-    fontSize: 13,
-  },
+  opatFloatingOk: { background: "#f8fafc", color: "#166534", borderColor: "#bbf7d0" },
+  opatFloatingExpired: { background: "#fff1f2", color: "#b91c1c", borderColor: "#fecdd3" },
+  opatFloatingChecking: { background: "#eff6ff", color: "#1d4ed8", borderColor: "#bfdbfe" },
+  opatFloatingUnknown: { background: "#ffffff", color: "#475569" },
+  opatDot: { width: 8, height: 8, borderRadius: 999, background: "currentColor" },
   toast: {
     position: "fixed",
     right: 20,
