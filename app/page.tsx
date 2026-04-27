@@ -191,6 +191,7 @@ type PtsDiariosMesItem = {
 const LS_ACOPLES_KEY = "cct_acoples_v1";
 const LS_HISTORIAL_KEY = "cct_historial_v1";
 const LS_MANUALES_KEY = "cct_pts_manuales_v1";
+const MANUAL_PTS_SHEET = "ManualPTs";
 
 const DEFAULT_USUARIO = "Nicolás Lorenzen";
 const DEFAULT_ORIGEN = "APP_CALENDARIO_CCT";
@@ -1032,7 +1033,7 @@ function getCenAlertItems(trabajos: TrabajoUI[], now: Date) {
 
     const fourthBusinessDayBefore = subtractBusinessDays(workDate, 4);
     const lastDay4Business = addDays(fourthBusinessDayBefore, -1);
-    
+
     const lastDay12Calendar = subtractCalendarDays(workDate, 13);
 
     if (sameDate(lastDay4Business, effectiveToday)) {
@@ -1202,6 +1203,13 @@ function truncateSoft(value: string, max = 32) {
   return `${text.slice(0, max - 1)}…`;
 }
 
+function parseManualPTRows(rows: any[][]): string[] {
+  return rows
+    .slice(1)
+    .map((row) => String(row[0] || "").trim())
+    .filter(Boolean);
+}
+
 export default function Page() {
   const [data, setData] = useState<OpatTrabajo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1323,7 +1331,7 @@ export default function Page() {
     saveJSON(LS_MANUALES_KEY, manualPtIds);
   }, [manualPtIds]);
 
-  const marcarPtManual = (pt: string) => {
+  const marcarPtManual = async (pt: string) => {
     const clean = String(pt || "").trim();
     if (!clean) return;
 
@@ -1331,6 +1339,17 @@ export default function Page() {
       if (prev.includes(clean)) return prev;
       return [...prev, clean];
     });
+
+    try {
+      await gsAppend(MANUAL_PTS_SHEET, [
+        clean,
+        new Date().toISOString(),
+        DEFAULT_USUARIO,
+        DEFAULT_ORIGEN,
+      ]);
+    } catch (err) {
+      console.error("No se pudo guardar PT manual en Google Sheet:", err);
+    }
   };
 
   const checkOpatHealth = async (silent = true) => {
@@ -1452,13 +1471,15 @@ export default function Page() {
     useEffect(() => {
     const cargarPersistencia = async () => {
       try {
-        const [rawHistorial, rawAcoples] = await Promise.all([
+        const [rawHistorial, rawAcoples, rawManualPts] = await Promise.all([
           gsRead("HistorialCambios"),
           gsRead("Acoples"),
+          gsRead(MANUAL_PTS_SHEET),
         ]);
 
         setHistorial(parseHistorialRows(rawHistorial));
         setAcoples(parseAcoplesRows(rawAcoples));
+        setManualPtIds(parseManualPTRows(rawManualPts));
       } catch (gsError) {
         console.error(
           "No se pudo cargar Google Sheet, uso localStorage como respaldo:",
@@ -2074,7 +2095,7 @@ export default function Page() {
         throw new Error(msg);
       }
 
-      marcarPtManual(payload.pt);
+      await marcarPtManual(payload.pt);
 
       setData((prev) => [payload, ...prev]);
 
@@ -2189,7 +2210,7 @@ export default function Page() {
         );
       }
 
-      marcarPtManual(nuevoPt);
+      await marcarPtManual(nuevoPt);
 
       await cargarOPAT();
 
