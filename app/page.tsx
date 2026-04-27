@@ -1340,6 +1340,8 @@ export default function Page() {
       return [...prev, clean];
     });
 
+    console.log("Guardando PT manual en Google Sheet:", clean);
+
     try {
       await gsAppend(MANUAL_PTS_SHEET, [
         clean,
@@ -1347,8 +1349,11 @@ export default function Page() {
         DEFAULT_USUARIO,
         DEFAULT_ORIGEN,
       ]);
+
+      console.log("PT manual guardado OK:", clean);
     } catch (err) {
       console.error("No se pudo guardar PT manual en Google Sheet:", err);
+      mostrarToast("PT creado, pero no se guardó como manual en BD");
     }
   };
 
