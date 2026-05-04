@@ -1335,13 +1335,6 @@ export default function Page() {
     const clean = String(pt || "").trim();
     if (!clean) return;
 
-    setManualPtIds((prev) => {
-      if (prev.includes(clean)) return prev;
-      return [...prev, clean];
-    });
-
-    console.log("Guardando PT manual en Google Sheet:", clean);
-
     try {
       await gsAppend(MANUAL_PTS_SHEET, [
         clean,
@@ -1350,12 +1343,19 @@ export default function Page() {
         DEFAULT_ORIGEN,
       ]);
 
-      console.log("PT manual guardado OK:", clean);
-    } catch (err) {
-      console.error("No se pudo guardar PT manual en Google Sheet:", err);
-      mostrarToast("PT creado, pero no se guardó como manual en BD");
-    }
-  };
+    setManualPtIds((prev) => {
+      if (prev.includes(clean)) return prev;
+      return [...prev, clean];
+    });
+
+    mostrarToast(`PT manual guardado en BD: ${clean}`);
+  } catch (err: any) {
+    console.error("No se pudo guardar PT manual en Google Sheet:", err);
+    alert(`Error guardando PT manual en Google Sheet: ${err?.message || err}`);
+    throw err;
+  }
+};
+  
 
   const checkOpatHealth = async (silent = true) => {
     try {
@@ -1529,6 +1529,8 @@ export default function Page() {
       ]);
     } catch (err) {
       console.error("No se pudo guardar historial en Google Sheet:", err);
+      alert(`Error guardando historial en Google Sheet: ${err?.message || err}`);
+      throw err;
     }
   };
 
@@ -2634,6 +2636,49 @@ export default function Page() {
         })
       );
 
+      
+      const cambiosDetalle: string[] = [];
+
+      if (trabajoSeleccionado.fecha !== editForm.fecha) {
+        cambiosDetalle.push(`Fecha: ${trabajoSeleccionado.fecha} → ${editForm.fecha}`);
+      }
+
+      if (trabajoSeleccionado.horaInicio !== editForm.horaInicio || trabajoSeleccionado.horaFin !== editForm.horaFin) {
+        cambiosDetalle.push(
+          `Horario: ${trabajoSeleccionado.horaInicio}-${trabajoSeleccionado.horaFin} → ${editForm.horaInicio}-${editForm.horaFin}`
+        );
+      }
+
+      if (trabajoSeleccionado.estado !== editForm.estado) {
+        cambiosDetalle.push(`Estado: ${trabajoSeleccionado.estado} → ${editForm.estado}`);
+      }
+
+      if (trabajoSeleccionado.programador !== editForm.programador) {
+        cambiosDetalle.push(`Programador: ${trabajoSeleccionado.programador || "-"} → ${editForm.programador || "-"}`);
+      }
+
+      if (trabajoSeleccionado.aviso !== editForm.aviso) {
+        cambiosDetalle.push(`Aviso CEN: ${trabajoSeleccionado.aviso || "-"} → ${editForm.aviso || "-"}`);
+      }
+
+      if (cambiosDetalle.length > 0 && !(oldEstado !== "Suspendido" && editForm.estado === "Suspendido")) {
+        const historialItem: HistoryItem = {
+          id: makeId("hist"),
+          tipo: "reprogramacion",
+          pt: trabajoSeleccionado.pt,
+          fechaOrigen: trabajoSeleccionado.fecha,
+          fechaDestino: editForm.fecha,
+          motivo: "Edición manual desde detalle del trabajo",
+          timestamp: formatTimestamp(new Date()),
+          detalle: cambiosDetalle.join(" | "),
+          usuario: DEFAULT_USUARIO,
+          origen: DEFAULT_ORIGEN,
+        };
+
+        setHistorial((prev) => [historialItem, ...prev]);
+        await appendHistorialPersist(historialItem);
+      }
+      
       if (oldEstado !== "Suspendido" && editForm.estado === "Suspendido") {
         const historialItem: HistoryItem = {
           id: makeId("hist"),

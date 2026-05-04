@@ -28,7 +28,7 @@ export async function GET() {
     const cookie = getOpatCookieOrThrow();
 
     const response = await fetch(
-      "https://opat.cl/operaciones_sts/api.php?accion=obtenerAgenda&t=" +
+      "https://opat.cl/agendaopat/api.php?accion=obtenerAgenda&t=" +
         Date.now(),
       {
         method: "GET",
