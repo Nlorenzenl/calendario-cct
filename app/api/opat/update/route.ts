@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
     formData.append("data", JSON.stringify(body));
 
     const url =
-      "https://opat.cl/operaciones_sts/api.php?accion=guardarUnPT&t=" +
+      "https://opat.cl/agendaopat/api.php?accion=guardarUnPT&t=" +
       Date.now();
 
     const response = await fetch(url, {

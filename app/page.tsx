@@ -1532,7 +1532,7 @@ export default function Page() {
 
       const message = err instanceof Error ? err.message : String(err);
       alert(`Error guardando historial en Google Sheet: ${message}`);
-      
+
       throw err;
     }
   };
@@ -1589,7 +1589,9 @@ export default function Page() {
           });
         }
 
-        throw new Error(msg);
+        throw new Error(
+          `${msg} ${json?.rawPreview ? " | OPAT: " + json.rawPreview : ""}`
+        );
       }
 
       if (!Array.isArray(json)) {
