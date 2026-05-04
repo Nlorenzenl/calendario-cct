@@ -1529,7 +1529,10 @@ export default function Page() {
       ]);
     } catch (err) {
       console.error("No se pudo guardar historial en Google Sheet:", err);
-      alert(`Error guardando historial en Google Sheet: ${err?.message || err}`);
+
+      const message = err instanceof Error ? err.message : String(err);
+      alert(`Error guardando historial en Google Sheet: ${message}`);
+      
       throw err;
     }
   };
